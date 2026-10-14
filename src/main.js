@@ -26,7 +26,29 @@ const BLOCKS = {
   field: { label: 'Text field', def: 'Field' }, notes: { label: 'Long notes', def: 'Notes' }, checklist: { label: 'Checklist', def: 'Checklist' },
   number: { label: 'Number', def: 'Number' }, date: { label: 'Date', def: 'Date' }, link: { label: 'Link', def: 'Link' },
   rating: { label: 'Star rating', def: 'Rating' }, heading: { label: 'Section heading', def: 'Section' },
+  choice: { label: 'Choice', def: 'Status' }, yesno: { label: 'Yes / No', def: 'Done?' }, time: { label: 'Time', def: 'Time' },
 };
+const BLOCK_TIPS = {
+  field: 'A short line of text, like a name or place', notes: 'A big box for writing', checklist: 'A list you can tick off',
+  number: 'A number, like a cost or a count', date: 'A date, like a due date', link: 'A web address you can tap to open',
+  rating: 'One to five stars', heading: 'A title that splits the page into parts', choice: 'Pick one option, like a mood or a status',
+  yesno: 'A quick yes or no, like “Paid?”', time: 'A time of day',
+};
+// Starting points for the format builder: [type, label, hint or options]
+const IDEAS = [
+  { name: 'Doctor visit', color: '#0c8599', style: 'clean', blocks: [['field', 'Doctor', 'Name'], ['field', 'Where', 'Office or address'], ['checklist', 'Questions to ask'], ['notes', 'What they said'], ['date', 'Follow-up']] },
+  { name: 'Habit check-in', color: '#2f9e44', style: 'clean', blocks: [['yesno', 'Worked out?'], ['yesno', 'Drank enough water?'], ['yesno', 'Read?'], ['choice', 'Mood', 'Great, Good, Okay, Low'], ['notes', 'Notes']] },
+  { name: 'Reading log', color: '#7048e8', style: 'notebook', blocks: [['field', 'Book'], ['field', 'Author'], ['number', 'Pages read'], ['rating', 'Rating'], ['notes', 'Thoughts']] },
+  { name: 'Meal or recipe', color: '#e8590c', style: 'pastel', blocks: [['field', 'Dish'], ['link', 'Recipe link'], ['checklist', 'Ingredients'], ['notes', 'Steps'], ['rating', 'How it turned out']] },
+  { name: 'Meeting', color: '#4263eb', style: 'clean', blocks: [['field', 'With'], ['field', 'Where', 'Room or video link'], ['checklist', 'Agenda'], ['notes', 'Notes'], ['checklist', 'Action items']] },
+  { name: 'Project or assignment', color: '#1c7ed6', style: 'notebook', blocks: [['date', 'Due'], ['choice', 'Status', 'Not started, In progress, Done'], ['checklist', 'Steps'], ['link', 'Link'], ['notes', 'Notes']] },
+  { name: 'Plans with friends', color: '#d6336c', style: 'pastel', blocks: [['field', 'Who'], ['field', 'Where'], ['link', 'Reservation'], ['number', 'Budget'], ['notes', 'Plan']] },
+  { name: 'Journal', color: '#ae3ec9', style: 'notebook', blocks: [['choice', 'Mood', 'Great, Good, Okay, Low'], ['rating', 'Energy'], ['checklist', 'Grateful for'], ['notes', 'Today']] },
+  { name: 'Appointment', color: '#f08c00', style: 'clean', blocks: [['field', 'With', 'Hair, nails, dentist…'], ['field', 'Where'], ['number', 'Cost'], ['yesno', 'Booked?'], ['notes', 'Notes']] },
+  { name: 'Bill or payment', color: '#868e96', style: 'clean', blocks: [['number', 'Amount'], ['date', 'Due'], ['yesno', 'Paid?'], ['link', 'Pay here'], ['notes', 'Notes']] },
+];
+const ideaBlocks = idea => idea.blocks.map(([type, label, extra]) => ({ id: uid(), type, label, placeholder: type === 'choice' ? '' : extra || '', ...(type === 'choice' ? { options: extra || '' } : {}) }));
+const choiceOpts = b => String(b.options || '').split(',').map(x => x.trim()).filter(Boolean);
 const STYLES = { clean: { name: 'Clean', skin: '' }, notebook: { name: 'Notebook', skin: 'fmt-class' }, dark: { name: 'Dark', skin: 'fmt-workout' }, pastel: { name: 'Pastel', skin: 'fmt-birthday' } };
 
 const FORMATS = {
@@ -430,7 +452,7 @@ function summary(e) {
     case 'trip': return [d.from && d.to && `${d.from.toUpperCase()} → ${d.to.toUpperCase()}`, d.stay].filter(Boolean).join(' · ');
     default: {
       const cf = customOf(e.format);
-      if (cf) { for (const b of cf.blocks) { const v = d[b.id]; if (typeof v === 'string' && v.trim()) return v.split('\n')[0]; } return ''; }
+      if (cf) { for (const b of cf.blocks) { if (b.type === 'yesno') continue; const v = d[b.id]; if (typeof v === 'string' && v.trim()) return v.split('\n')[0]; } return ''; }
       return (d.notes || '').split('\n')[0];
     }
   }
@@ -684,12 +706,14 @@ function bodyCustom(o, cf) {
     if (b.type !== 'heading' && o.data[b.id] === undefined) o.data[b.id] = blockDefault(b.type);
     const v = o.data[b.id];
     switch (b.type) {
-      case 'field': case 'number': case 'date': case 'link': {
-        const type = b.type === 'date' ? 'date' : b.type === 'link' ? 'url' : 'text';
+      case 'field': case 'number': case 'date': case 'link': case 'time': {
+        const type = b.type === 'date' ? 'date' : b.type === 'link' ? 'url' : b.type === 'time' ? 'time' : 'text';
         group.push(`<label class="field"><span>${lab}</span><span class="inrow"><input type="${type}" id="d-${b.id}" data-d="${b.id}" value="${esc(v)}" placeholder="${ph}" ${b.type === 'number' ? 'inputmode="decimal"' : ''}>${b.type === 'link' && safeUrl(v) ? `<a href="${esc(v)}" target="_blank" rel="noopener noreferrer">Open</a>` : ''}</span></label>`);
         break;
       }
       case 'heading': flushGroup(); h += `<h2>${lab}</h2>`; break;
+      case 'yesno': group.push(`<div class="field"><span>${lab}</span><div class="yn" role="group" aria-label="${lab}"><button data-act="yn" data-b="${b.id}" data-v="yes" aria-pressed="${v === 'yes'}">Yes</button><button data-act="yn" data-b="${b.id}" data-v="no" aria-pressed="${v === 'no'}">No</button></div></div>`); break;
+      case 'choice': { flushGroup(); const opts = choiceOpts(b); h += `<h2>${lab}</h2>${opts.length ? `<div class="pick choice">${opts.map(x => `<button data-act="choose" data-b="${b.id}" data-v="${esc(x)}" aria-pressed="${v === x}">${esc(x)}</button>`).join('')}</div>` : `<p style="color:var(--d-muted)">Add options for this in the format builder.</p>`}`; break; }
       case 'rating': flushGroup(); h += `<h2>${lab}</h2><div class="stars">${[1, 2, 3, 4, 5].map(n => `<button data-act="rate" data-b="${b.id}" data-v="${n}" aria-label="${n} of 5" aria-pressed="${(+v || 0) >= n}">★</button>`).join('')}</div>`; break;
       case 'checklist': flushGroup(); h += `<h2>${lab}</h2>` + list(o, b.id, ph || 'Add an item'); break;
       case 'notes': flushGroup(); h += `<h2>${lab}</h2><textarea class="${cf.style === 'notebook' ? 'c-notes' : 'notes'}" id="d-${b.id}" data-d="${b.id}" placeholder="${ph || 'Write anything…'}">${esc(v)}</textarea>`; break;
@@ -704,7 +728,7 @@ const docAccent = f => { const cf = customOf(f); return cf ? `;--d-accent:${okCo
 
 /* ---------- format builder ---------- */
 function newFormat(name, color) {
-  const f = { id: uid(), name: name || '', style: 'clean', color: color || SWATCHES[4], blocks: [{ id: uid(), type: 'notes', label: 'Notes', placeholder: '' }] };
+  const f = { id: uid(), name: name || '', style: 'clean', color: color || SWATCHES[4], blocks: [{ id: uid(), type: 'notes', label: 'Notes', placeholder: '' }], fresh: true };
   db.formats.push(f); save(); return f;
 }
 function openBuilder(id, backMode) {
@@ -723,11 +747,14 @@ function renderBuilder() {
   const used = db.events.filter(e => e.format === 'c:' + cf.id).length;
   const blocks = cf.blocks.map((b, i) => `<div class="blk"><span class="blk-t">${BLOCKS[b.type].label}</span><div class="blk-a"><button data-act="bf-up" data-i="${i}" aria-label="Move up"${i ? '' : ' disabled'}>↑</button><button data-act="bf-down" data-i="${i}" aria-label="Move down"${i < cf.blocks.length - 1 ? '' : ' disabled'}>↓</button><button data-act="bf-del" data-i="${i}" aria-label="Remove section">×</button></div>
       <input id="bb-${b.id}" data-bb="${i}" data-bbf="label" value="${esc(b.label)}" placeholder="Label" aria-label="Label">
-      ${['field', 'notes', 'checklist', 'number', 'link'].includes(b.type) ? `<input id="bbp-${b.id}" data-bb="${i}" data-bbf="placeholder" value="${esc(b.placeholder || '')}" placeholder="Hint text (optional)" aria-label="Hint text">` : ''}</div>`).join('');
+      ${['field', 'notes', 'checklist', 'number', 'link'].includes(b.type) ? `<input id="bbp-${b.id}" data-bb="${i}" data-bbf="placeholder" value="${esc(b.placeholder || '')}" placeholder="Hint text (optional)" aria-label="Hint text">` : ''}
+      ${b.type === 'choice' ? `<input id="bbo-${b.id}" data-bb="${i}" data-bbf="options" value="${esc(b.options || '')}" placeholder="Options, separated by commas: Great, Okay, Rough" aria-label="Options">` : ''}</div>`).join('');
+  const ideas = cf.fresh ? `<div class="panel ideas"><h2 class="sec" style="margin-top:0">Start from an idea</h2><p class="muted" style="margin:0 0 10px">Pick one to fill in the sections for you, then change anything you like.</p>
+      <div class="pick">${IDEAS.map((d, n) => `<button data-act="bf-idea" data-i="${n}" style="--c:${d.color}"><span class="dot"></span>${esc(d.name)}</button>`).join('')}<button data-act="bf-blank">Start blank</button></div></div>` : '';
   return `<div class="page builder"><button class="back-plain" data-act="bf-back">‹ ${view.back.mode === 'calendars' ? 'Calendars' : 'Library'}</button>
     <span class="eyebrow">Format builder</span>
     <input class="bf-name" id="bf-name" data-bf="name" value="${esc(cf.name)}" placeholder="Name this format, e.g. Doctor visit" aria-label="Format name">
-    <div class="bf-grid"><div class="bf-side">
+    <div class="bf-grid"><div class="bf-side">${ideas}
       <div class="panel stack">
         <div class="field"><span>Style</span><div class="pick">${Object.entries(STYLES).map(([k, s]) => `<button data-act="bf-style" data-v="${k}" aria-pressed="${cf.style === k}">${s.name}</button>`).join('')}</div></div>
         <div class="field"><span>Accent color</span><div class="swatches">${SWATCHES.map(s => `<button class="sw" style="--c:${s}" data-act="bf-color" data-v="${s}" aria-pressed="${s === cf.color}" aria-label="Color ${s}"></button>`).join('')}</div></div>
@@ -735,7 +762,7 @@ function renderBuilder() {
       <div class="panel"><h2 class="sec" style="margin-top:0">Sections</h2>
         <div class="blocks">${blocks || '<p class="muted" style="margin:0">No sections yet. Add some below.</p>'}</div>
         <span class="eyebrow" style="margin:16px 0 8px">Add a section</span>
-        <div class="pick">${Object.entries(BLOCKS).map(([k, v]) => `<button data-act="bf-add" data-type="${k}">+ ${v.label}</button>`).join('')}</div>
+        <div class="pick">${Object.entries(BLOCKS).map(([k, v]) => `<button data-act="bf-add" data-type="${k}" title="${esc(BLOCK_TIPS[k])}">+ ${v.label}</button>`).join('')}</div>
       </div>
       <div class="m-row"><button class="btn primary" data-act="new" data-fmt="c:${cf.id}">Use for an event</button>
         ${confirmFmt ? `<button class="btn" data-act="bf-delete-cancel">Keep</button><button class="btn danger solid" data-act="bf-delete-confirm">Delete format${used ? ` (${used} event${used > 1 ? 's' : ''} switch to Notes)` : ''}</button>` : `<button class="btn danger" data-act="bf-delete">Delete format</button>`}</div>
@@ -1034,7 +1061,7 @@ function leaveDoc() {
 }
 function go(mode, date) { leaveDoc(); modal = null; view = { mode, date: date || view.date }; render(); window.scrollTo(0, 0); }
 function openDoc(kind, id) {
-  const back = view.mode === 'doc' ? view.back : { mode: view.mode };
+  const back = view.mode === 'doc' ? view.back : { mode: ['builder', 'settings', 'welcome'].includes(view.mode) ? 'week' : view.mode };
   leaveDoc(); modal = null;
   const date = kind === 'event' ? db.events.find(e => e.id === id)?.date : view.date;
   view = { mode: 'doc', kind, id, date: date || view.date, back };
@@ -1182,12 +1209,25 @@ document.addEventListener('click', ev => {
     case 'bf-new': { const f = newFormat('', SWATCHES[4]); openBuilder(f.id, 'library'); $('bf-name')?.focus(); break; }
     case 'bf-edit': openBuilder(ds.id, 'library'); break;
     case 'bf-back': go(view.back.mode === 'calendars' ? 'calendars' : 'library', view.date); break;
+    case 'bf-idea': case 'bf-blank': {
+      const cf = db.formats.find(x => x.id === view.id); if (!cf) return;
+      delete cf.fresh;
+      if (a === 'bf-idea') {
+        const idea = IDEAS[+ds.i], fromCal = view.back.mode === 'calendars';
+        cf.blocks = ideaBlocks(idea); cf.style = idea.style;
+        if (!cf.name.trim()) cf.name = idea.name;
+        if (!fromCal) cf.color = idea.color;   // a calendar's own color stays
+      }
+      save(); { const y = scrollY; render(); scrollTo(0, y); }
+      break;
+    }
+    case 'yn': case 'choose': { o.data[ds.b] = o.data[ds.b] === ds.v ? '' : ds.v; save(); { const y = scrollY; render(); scrollTo(0, y); } break; }
     case 'bf-style': case 'bf-color': case 'bf-add': case 'bf-up': case 'bf-down': case 'bf-del': {
       const cf = db.formats.find(x => x.id === view.id); if (!cf) return;
-      const i = +ds.i;
+      const i = +ds.i; delete cf.fresh;
       if (a === 'bf-style') cf.style = ds.v;
       if (a === 'bf-color') cf.color = ds.v;
-      if (a === 'bf-add') cf.blocks.push({ id: uid(), type: ds.type, label: BLOCKS[ds.type].def, placeholder: '' });
+      if (a === 'bf-add') cf.blocks.push({ id: uid(), type: ds.type, label: BLOCKS[ds.type].def, placeholder: '', ...(ds.type === 'choice' ? { options: '' } : {}) });
       if (a === 'bf-up' && i > 0) [cf.blocks[i - 1], cf.blocks[i]] = [cf.blocks[i], cf.blocks[i - 1]];
       if (a === 'bf-down' && i < cf.blocks.length - 1) [cf.blocks[i + 1], cf.blocks[i]] = [cf.blocks[i], cf.blocks[i + 1]];
       if (a === 'bf-del') cf.blocks.splice(i, 1);
@@ -1233,7 +1273,7 @@ document.addEventListener('input', ev => {
   if (ds.cal) { const c = db.calendars.find(x => x.id === ds.cal); if (c) { c[ds.cf] = t.value; save(); } return; }
   if (view.mode === 'builder' && (ds.bf || ds.bb !== undefined)) {
     const cf = db.formats.find(x => x.id === view.id); if (!cf) return;
-    if (ds.bf) cf[ds.bf] = t.value; else cf.blocks[+ds.bb][ds.bbf] = t.value;
+    if (ds.bf) cf[ds.bf] = t.value; else { cf.blocks[+ds.bb][ds.bbf] = t.value; delete cf.fresh; }
     save(); $('bf-prev').innerHTML = builderPreview(cf);
     return;
   }

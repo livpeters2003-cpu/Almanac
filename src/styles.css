@@ -472,3 +472,12 @@ svg.ic.rep { width: 12px; height: 12px; margin-left: auto; color: var(--muted) !
 .toast { display: flex; align-items: center; gap: 14px; }
 .toast-act { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; padding: 0; cursor: pointer; }
 body.dropping::after { content: 'Drop your spreadsheet to import it'; position: fixed; inset: 12px; z-index: 50; border: 3px dashed var(--accent); border-radius: 18px; background: color-mix(in srgb, var(--bg) 88%, transparent); display: grid; place-items: center; font: 700 22px/1.2 var(--f-display); color: var(--ink); pointer-events: none; }
+
+/* builder ideas and new section types */
+.yn { display: inline-flex; border: 1px solid var(--d-line, var(--line)); border-radius: 10px; overflow: hidden; align-self: flex-start; }
+.yn button { border: 0; background: transparent; color: inherit; padding: 7px 16px; font: inherit; font-weight: 600; }
+.yn button + button { border-left: 1px solid var(--d-line, var(--line)); }
+.yn button[aria-pressed="true"] { background: var(--d-accent, var(--c, var(--accent))); color: #fff; }
+.doc .pick.choice { margin-top: 8px; }
+.doc .pick.choice button { color: inherit; background: transparent; border-color: var(--d-line, var(--line)); }
+.doc .pick.choice button[aria-pressed="true"] { --c: var(--d-accent, var(--accent)); background: color-mix(in srgb, var(--c) 18%, transparent); }
