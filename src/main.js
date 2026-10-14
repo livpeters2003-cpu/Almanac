@@ -19,6 +19,7 @@ const ICONS = {
   trip: '<path d="M10.2 13.8 6 18l-2.5-.5L3 16l4.3-1.7M13.8 10.2 18 6c1-1 2.5-1.5 3-1 .5.5 0 2-1 3l-4.2 4.2 1.7 7.3-1.5 1.5-3.3-6.3-3.3 3.3.4 2.3-1.3 1.2-1.6-3.2-3.2-1.6 1.2-1.3 2.3.4 3.3-3.3L4.2 7.7l1.5-1.5z"/>',
   notes: '<path d="M6 3h9l4 4v14H6zM14.5 3v4.5H19M9 12h7M9 16h5"/>',
   custom: '<path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM16.5 13.5v6M13.5 16.5h6"/>',
+  bill: '<path d="M6 2.5h12v19l-2-1.5-2 1.5-2-1.5-2 1.5-2-1.5-2 1.5zM9 7.5h6M9 11h6M9 14.5h3.5"/>',
 };
 const isCustom = f => typeof f === 'string' && f.startsWith('c:');
 const icon = f => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[f] || (isCustom(f) ? ICONS.custom : ICONS.notes)}</svg>`;
@@ -56,6 +57,7 @@ const FORMATS = {
   birthday: { name: 'Birthday', blurb: 'A countdown, who’s turning what, gift ideas with prices, party plans and a card message.' },
   class: { name: 'Class', blurb: 'Notebook paper with course, room, instructor, assignments with due dates and lecture notes.' },
   trip: { name: 'Trip', blurb: 'A boarding pass with your route, booking code and seat, where you’re staying and a packing list.' },
+  bill: { name: 'Bill', blurb: 'A bill or payment: the amount, whether it’s paid or on autopay, where it’s paid from, a pay link, and this month’s total.' },
   notes: { name: 'Notes', blurb: 'A clean page with a title and notes, for anything that doesn’t need a special layout.' },
 };
 const THUMBS = {
@@ -63,6 +65,7 @@ const THUMBS = {
   birthday: '<b>12</b><small>days to go</small><span>Sam turns 30</span>',
   class: '<b>BIO 110</b><i></i><i></i><i></i>',
   trip: `<div><b>LAX</b><svg class="ic" viewBox="0 0 24 24">${ICONS.trip}</svg><b>JFK</b><span></span></div>`,
+  bill: '<small>Rent · due the 1st</small><b>$1,450.00</b><span>Paid</span>',
   notes: '<b>Notes</b><i></i><i></i><i></i><i></i>',
 };
 
@@ -112,6 +115,7 @@ function blankData(f) {
     birthday: { person: '', turning: '', gifts: [], where: '', theme: '', message: '', notes: '' },
     class: { code: '', room: '', instructor: '', tasks: [], notes: '' },
     trip: { from: '', fromCity: '', to: '', toCity: '', ref: '', seat: '', stay: '', packing: [], notes: '' },
+    bill: { amount: '', paid: '', autopay: '', account: '', link: '', notes: '' },
     notes: { notes: '' },
   }[f] || { notes: '' });
 }
@@ -372,6 +376,7 @@ function materialize(occ) {
   const [mid, date] = String(occ).split('@'), m = db.events.find(e => e.id === mid);
   if (!m || !date) return null;
   const ev = { ...clone(m), id: uid(), date, seriesId: m.id, data: resetDone(clone(m.data)) };
+  if (ev.format === 'bill') ev.data.paid = '';
   delete ev.repeat;
   m.repeat = { ...m.repeat, skip: [...new Set([...(m.repeat?.skip || []), date])] };
   db.events.push(ev); save();
@@ -382,7 +387,7 @@ function byDate() {
   const [from, to] = rangeAround(), m = {}, add = (s, e) => (m[s] || (m[s] = [])).push(e);
   for (const e of visibleEvents()) {
     if (!(e.repeat?.skip || []).includes(e.date)) add(e.date, e);
-    for (const s of occurrences(e, from, to)) add(s, { ...e, id: occId(e.id, s), date: s, _occ: e.id });
+    for (const s of occurrences(e, from, to)) add(s, { ...e, id: occId(e.id, s), date: s, _occ: e.id, ...(e.format === 'bill' ? { data: { ...e.data, paid: '' } } : {}) });
   }
   for (const k in m) m[k].sort(byTime);
   return m;
@@ -442,6 +447,24 @@ function duration(o) {
   return (m >= 60 ? Math.floor(m / 60) + 'h ' : '') + (m % 60 ? (m % 60) + 'min' : '').trim();
 }
 
+/* ---------- bills ---------- */
+const amountOf = v => parseFloat(String(v ?? '').replace(/[^0-9.\-]/g, '')) || 0;
+const money = v => { const n = typeof v === 'number' ? v : amountOf(v); return n || String(v ?? '').trim() ? n.toLocaleString(undefined, { style: 'currency', currency: 'USD' }) : ''; };
+// Every bill in a month (repeating bills included), from calendars that are showing.
+function monthBills(y, mo, map = byDate()) {
+  const out = [], last = new Date(y, mo + 1, 0).getDate();
+  for (let d = 1; d <= last; d++) for (const e of map[iso(new Date(y, mo, d))] || []) if (e.format === 'bill') out.push(e);
+  const total = out.reduce((t, e) => t + amountOf(e.data.amount), 0), paid = out.filter(e => e.data.paid === 'yes'), left = out.filter(e => e.data.paid !== 'yes');
+  return { list: out, total, paid: paid.reduce((t, e) => t + amountOf(e.data.amount), 0), left };
+}
+let billsOpen = false;
+function billsBar(y, mo, map) {
+  const b = monthBills(y, mo, map); if (!b.list.length) return '';
+  const next = b.left.find(e => e.date >= todayS()) || b.left[0];
+  return `<section class="bills"><button class="bills-h" data-act="bills-toggle" aria-expanded="${billsOpen}"><span class="bills-t">${icon('bill')}${MONTHS[mo]} bills</span><span class="bills-n"><b>${money(b.total)}</b> · ${money(b.paid)} paid · ${b.left.length ? `${b.left.length} left${next ? `, next ${esc(next.title || 'bill')} ${shortDate(parse(next.date))}` : ''}` : 'all paid'}</span><span class="bills-c">${billsOpen ? 'Hide' : 'Show all'}</span></button>
+    ${billsOpen ? `<div class="bills-l">${b.list.map(e => `<button data-act="open" data-id="${e.id}" class="${e.data.paid === 'yes' ? 'paid' : ''}" style="--c:${okColor(calOf(e).color)}"><span>${shortDate(parse(e.date))}</span><b>${esc(e.title || 'Bill')}</b><em>${e.data.paid === 'yes' ? 'Paid' : e.data.autopay === 'yes' ? 'Autopay' : ''}</em><span>${money(e.data.amount)}</span></button>`).join('')}</div>` : ''}</section>`;
+}
+
 /* ---------- summaries ---------- */
 function summary(e) {
   const d = e.data || {};
@@ -449,6 +472,7 @@ function summary(e) {
     case 'workout': { const s = wStats(e); const n = d.exercises.length; return n ? `${n} exercise${n > 1 ? 's' : ''} · ${s.tot} sets${s.done ? ` · ${s.done} done` : ''}` : ''; }
     case 'birthday': return [d.person && (d.person + (d.turning ? ` turns ${d.turning}` : '')), d.gifts.length && `${d.gifts.length} gift idea${d.gifts.length > 1 ? 's' : ''}`].filter(Boolean).join(' · ');
     case 'class': { const open = d.tasks.filter(t => !t.done).length; return [d.code, d.room, open && `${open} assignment${open > 1 ? 's' : ''} open`].filter(Boolean).join(' · '); }
+    case 'bill': return [money(d.amount), d.paid === 'yes' ? 'Paid' : d.autopay === 'yes' ? 'Autopay' : 'Not paid yet'].filter(Boolean).join(' · ');
     case 'trip': return [d.from && d.to && `${d.from.toUpperCase()} → ${d.to.toUpperCase()}`, d.stay].filter(Boolean).join(' · ');
     default: {
       const cf = customOf(e.format);
@@ -503,8 +527,8 @@ const REP_IC = '<svg class="ic rep" viewBox="0 0 24 24" aria-label="Repeats"><pa
 const isRep = e => !!(e._occ || (e.repeat && REPEATS[e.repeat.freq]));
 const chip = e => `<button class="chip" data-act="open" data-id="${e.id}" style="--c:${okColor(calOf(e).color)}"><span class="t">${icon(e.format)}${e.start ? fmtTime(e.start) : 'Any time'}${isRep(e) ? REP_IC : ''}</span><span class="n">${esc(e.title || 'Untitled')}</span></button>`;
 function renderWeek() {
-  const ws = startOfWeek(parse(view.date)), map = byDate(), hol = holidayMap(), t = todayS();
-  let h = onboarding() + '<div class="week">';
+  const ws = startOfWeek(parse(view.date)), map = byDate(), hol = holidayMap(), t = todayS(), vd = parse(view.date);
+  let h = onboarding() + billsBar(vd.getFullYear(), vd.getMonth(), map) + '<div class="week">';
   for (let i = 0; i < 7; i++) {
     const d = addDays(ws, i), s = iso(d);
     h += `<div class="wday${s === t ? ' today' : ''}"><button class="wday-h" data-act="day" data-date="${s}" aria-label="Open ${esc(longDate(d))}"><b>${d.getDate()}</b><span>${WD[i]}${d.getDate() === 1 || i === 0 ? ' · ' + MONTHS[d.getMonth()].slice(0, 3) : ''}</span></button><div class="wday-l">${(hol[s] || []).map(holChip).join('')}${(map[s] || []).map(chip).join('')}<button class="add-mini" data-act="new" data-date="${s}">+ Add</button></div></div>`;
@@ -689,8 +713,17 @@ function bodyTrip(o) {
     <h2>Packing list</h2>${list(o, 'packing', 'Passport, charger, …')}
     ${notesBlock(o, 'Notes', 'Plans, reservations, places to try…')}`;
 }
+function bodyBill(o) {
+  const d = o.data, yn = (k, label) => `<div class="field"><span>${label}</span><div class="yn" role="group" aria-label="${label}"><button data-act="yn" data-b="${k}" data-v="yes" aria-pressed="${d[k] === 'yes'}">Yes</button><button data-act="yn" data-b="${k}" data-v="no" aria-pressed="${d[k] === 'no'}">No</button></div></div>`;
+  const dt = parse(o.date), b = view.kind === 'event' ? monthBills(dt.getFullYear(), dt.getMonth()) : null;
+  return `<label class="bill-amt"><span>Amount</span><span class="inrow"><b>$</b><input id="d-amount" data-d="amount" value="${esc(String(d.amount ?? '').replace(/^\s*\$\s*/, ''))}" placeholder="0.00" inputmode="decimal"></span></label>
+    <div class="grid2" style="margin-top:14px">${yn('paid', 'Paid?')}${yn('autopay', 'Autopay?')}${dfield(o, 'account', 'Paid from', 'Card or account')}
+    <label class="field"><span>Pay online</span><span class="inrow"><input type="url" id="d-link" data-d="link" value="${esc(d.link)}" placeholder="https://">${safeUrl(d.link) ? `<a href="${esc(d.link)}" target="_blank" rel="noopener noreferrer">Open</a>` : ''}</span></label></div>
+    ${b && b.list.length ? `<div class="bill-month"><span>${MONTHS[dt.getMonth()]} bills</span><b>${money(b.total)}</b><small>${money(b.paid)} paid · ${money(b.total - b.paid)} left</small></div>` : ''}
+    ${notesBlock(o, 'Notes', 'Account number, due-date rules, anything to remember…')}`;
+}
 const bodyNotes = o => `<textarea class="notes" id="d-notes" data-d="notes" style="min-height:320px;margin-top:16px" placeholder="Write anything…">${esc(o.data.notes)}</textarea>`;
-const BODIES = { workout: bodyWorkout, birthday: bodyBirthday, class: bodyClass, trip: bodyTrip, notes: bodyNotes };
+const BODIES = { workout: bodyWorkout, birthday: bodyBirthday, class: bodyClass, trip: bodyTrip, bill: bodyBill, notes: bodyNotes };
 function bodyFor(o) {
   if (BODIES[o.format]) return BODIES[o.format](o);
   const cf = customOf(o.format);
@@ -818,6 +851,7 @@ function sample(f) {
       tasks: [{ text: 'Read chapter 4', due: iso(addDays(new Date(), 2)), done: true }, { text: 'Lab report 2', due: iso(addDays(new Date(), 5)), done: false }, { text: 'Midterm', due: iso(addDays(new Date(), 14)), done: false }] } },
     trip: { title: 'Weekend in New York', start: '07:15', end: '', data: { from: 'LAX', fromCity: 'Los Angeles', to: 'JFK', toCity: 'New York', ref: 'K7Q2LM', seat: '14A', stay: 'The Jane Hotel\n113 Jane St', notes: 'Saturday: Met in the morning, pizza in Brooklyn at night.',
       packing: [{ text: 'Passport / ID', done: true }, { text: 'Phone charger', done: false }, { text: 'Running shoes', done: false }] } },
+    bill: { title: 'Rent', start: '', end: '', data: { amount: '1450', paid: 'yes', autopay: 'no', account: 'Checking', link: '', notes: 'Due on the 1st. Late after the 5th.' } },
     notes: { title: 'Ideas for October', start: '', end: '', data: { notes: 'Try a new hike every weekend.\nSign up for the 10K.\nCall grandma on Sundays.' } },
   }[f];
   return { id: 'preview', calId: null, format: f, date, ...D, data: { ...blankData(f), ...D.data } };
@@ -1094,6 +1128,7 @@ document.addEventListener('click', ev => {
   const a = t.dataset.act, o = curObj(), ds = t.dataset;
   switch (a) {
     case 'mode': go(ds.mode, view.date); break;
+    case 'bills-toggle': billsOpen = !billsOpen; softRender(); break;
     case 'nav': { const d = parse(view.date), n = +ds.dir; if (view.mode === 'year') d.setFullYear(d.getFullYear() + n); if (view.mode === 'week') d.setDate(d.getDate() + 7 * n); if (view.mode === 'day') d.setDate(d.getDate() + n); go(view.mode, iso(d)); break; }
     case 'today': go(view.mode, todayS()); break;
     case 'day': go('day', ds.date); break;
