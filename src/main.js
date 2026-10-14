@@ -146,7 +146,7 @@ function loadLocal(who) { try { return normalize(JSON.parse(localStorage.getItem
 let owner = GUEST;
 let db = loadLocal(GUEST);
 const persistLocal = () => { try { localStorage.setItem(keyFor(owner), JSON.stringify(db)); } catch (e) {} };
-const save = () => { persistLocal(); scheduleSync(); };
+const save = () => { persistLocal(); scheduleSync(); syncRemindersSoon(); };
 // Bring calendars, events, templates, exercises and formats from another copy into this one, skipping ids already here.
 function mergeInto(target, src) {
   src = normalize(src);
@@ -287,7 +287,7 @@ async function pull() {
       if (key === 'events') out.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
       db[key] = out;
     });
-    ready = true; persistLocal(); applyTheme(); flush();
+    ready = true; persistLocal(); applyTheme(); flush(); syncRemindersSoon();
     if (!syncTimer && !syncing) setStatus('synced');
     softRender();
   } catch (e) {
@@ -325,6 +325,7 @@ function startSession(u) {
     cyc = (!mineC.settings.on && !Object.keys(mineC.logs).length && (guestC.settings.on || Object.keys(guestC.logs).length)) ? guestC : mineC;
     if (cyc === guestC) { try { localStorage.removeItem(cycleKey(GUEST)); } catch (e) {} }
     cycStats = null; cycDirty = new Set(); cycProfileDirty = false; }
+  remSynced = null; checkPush();
   render(); pull(); listen(); loadNews(); loadSocial().then(useInvite); pullCycle();
 }
 function endSession() {
@@ -552,7 +553,7 @@ const cycleOn = () => !!cyc.settings.on && !!cyc.settings.lastStart;
 function saveCycle(dates = [], profile = false) {
   cycStats = null;
   try { localStorage.setItem(cycleKey(owner), JSON.stringify(cyc)); } catch (e) {}
-  dates.forEach(d => cycDirty.add(d)); if (profile) cycProfileDirty = true;
+  dates.forEach(d => cycDirty.add(d)); if (profile) { cycProfileDirty = true; syncRemindersSoon(); }
   if (user) { clearTimeout(cycTimer); cycTimer = setTimeout(flushCycle, 800); }
 }
 async function flushCycle() {
@@ -643,6 +644,123 @@ function renderCycleSettings() {
   return h + '</section>';
 }
 let confirmCycleDel = false, cycOpen = false;
+
+/* ---------- reminders (notifications on your phone and computer) ---------- */
+// The app works out your upcoming reminders here, in your own time zone, and keeps the list on the server;
+// a small job sends whatever is due every few minutes.
+const REMIND_TIMED = { '': 'No reminder', '0': 'At the start', '10': '10 minutes before', '30': '30 minutes before', '60': '1 hour before', '1440': '1 day before' };
+const REMIND_ALLDAY = { '': 'No reminder', am0: 'That morning (9 am)', am1: 'The day before (9 am)' };
+const remPrefs = () => ({ on: false, events: true, checkin: false, checkinTime: '20:00', period: true, ...(db.prefs.reminders || {}) });
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+let pushState = { checked: false, subscribed: false, busy: false }, remTimer = null, remSynced = null;
+function fireTime(date, start, remind) {
+  const d = parse(date);
+  if (remind === 'am0' || remind === 'am1') { d.setHours(9, 0, 0, 0); if (remind === 'am1') d.setDate(d.getDate() - 1); return d; }
+  if (!start || remind === '' || remind === undefined) return null;
+  const [h, m] = start.split(':').map(Number); d.setHours(h, m, 0, 0);
+  return new Date(d - (+remind || 0) * 60e3);
+}
+function desiredReminders() {
+  const P = remPrefs(), now = new Date(), out = [];
+  if (!P.on) return out;
+  const from = todayS(), to = iso(addDays(new Date(), 35));
+  if (P.events) {
+    for (const e of db.events) {
+      const dates = [];
+      if (e.remind) {
+        if (!(e.repeat?.skip || []).includes(e.date) && e.date >= iso(addDays(new Date(), -1)) && e.date <= iso(addDays(new Date(), 36))) dates.push(e.date);
+        dates.push(...occurrences(e, from, to));
+      }
+      for (const d of dates) {
+        const t = fireTime(d, e.start, e.remind); if (!t || t <= now) continue;
+        const cal = db.calendars.find(c => c.id === e.calId);
+        const when = e.start ? fmtTime(e.start) : 'today';
+        out.push({ id: `ev:${e.id}@${d}`, fire_at: t.toISOString(), title: e.title || 'Event', body: [e.remind === 'am1' ? `Tomorrow${e.start ? ' at ' + fmtTime(e.start) : ''}` : e.start ? `${REMIND_TIMED[e.remind] === 'At the start' ? 'Starting now' : 'At ' + when}` : 'Today', cal?.name].filter(Boolean).join(' · '), url: `/?day=${d}` });
+      }
+    }
+  }
+  if (cycleOn()) {
+    if (P.checkin) for (let i = 0; i <= 14; i++) {
+      const d = iso(addDays(new Date(), i)), [h, m] = (P.checkinTime || '20:00').split(':').map(Number), t = parse(d); t.setHours(h, m, 0, 0);
+      if (t > now) out.push({ id: `checkin:${d}`, fire_at: t.toISOString(), title: 'Daily check-in', body: 'How are you feeling today? Tap to log it.', url: `/?day=${d}` });
+    }
+    if (P.period) {
+      const next = cycleInfo(todayS())?.nextStart;
+      if (next) { const t = parse(next); t.setDate(t.getDate() - 2); t.setHours(9, 0, 0, 0); if (t > now) out.push({ id: `period:${next}`, fire_at: t.toISOString(), title: 'Cycle', body: `Your period may start in about 2 days (${shortDate(parse(next))}).`, url: `/?day=${next}` }); }
+    }
+  }
+  return out.sort((a, b) => a.fire_at.localeCompare(b.fire_at)).slice(0, 300);
+}
+const syncRemindersSoon = () => { if (!user) return; clearTimeout(remTimer); remTimer = setTimeout(syncReminders, 2500); };
+async function syncReminders() {
+  if (!user || !ready) return;
+  const want = desiredReminders(), sig = JSON.stringify(want);
+  if (sig === remSynced) return;
+  try {
+    const { data: have, error } = await supa.from('reminders').select('id').eq('user_id', user.id).is('sent_at', null);
+    if (error) throw error;
+    const keep = new Set(want.map(r => r.id)), drop = (have || []).map(r => r.id).filter(id => !keep.has(id));
+    for (let i = 0; i < drop.length; i += 200) { const { error: e2 } = await supa.from('reminders').delete().eq('user_id', user.id).in('id', drop.slice(i, i + 200)); if (e2) throw e2; }
+    if (want.length) { const { error: e3 } = await supa.from('reminders').upsert(want.map(r => ({ ...r, user_id: user.id, sent_at: null }))); if (e3) throw e3; }
+    remSynced = sig;
+  } catch (e) { clearTimeout(remTimer); remTimer = setTimeout(syncReminders, 30000); }
+}
+async function checkPush() {
+  if (!pushSupported()) { pushState.checked = true; return; }
+  try { const reg = await navigator.serviceWorker.getRegistration(); const sub = await reg?.pushManager.getSubscription(); pushState = { ...pushState, checked: true, subscribed: !!sub && Notification.permission === 'granted' }; }
+  catch (e) { pushState.checked = true; }
+  if (view.mode === 'settings') softRender();
+}
+const b64ToBytes = b => { const s = atob((b + '='.repeat((4 - b.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(s, c => c.charCodeAt(0)); };
+async function enablePush() {
+  if (!user) { toast('Sign in first so reminders can reach your devices'); return; }
+  pushState.busy = true; softRender();
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('Notifications are blocked. Allow them for Almanac in your browser or phone settings.'); return; }
+    const res = await fetch('/api/push-key'); if (!res.ok) { toast('Notifications aren’t set up on the server yet.'); return; }
+    const { key } = await res.json();
+    const reg = await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+    const j = sub.toJSON();
+    const { error } = await supa.from('push_subscriptions').upsert({ endpoint: j.endpoint, user_id: user.id, p256dh: j.keys.p256dh, auth: j.keys.auth });
+    if (error) throw error;
+    db.prefs.reminders = { ...remPrefs(), on: true }; save(); remSynced = null; syncRemindersSoon();
+    pushState.subscribed = true; toast('Notifications are on for this device');
+  } catch (e) { toast('Couldn’t turn on notifications. Try again.'); }
+  finally { pushState.busy = false; softRender(); }
+}
+async function disablePush() {
+  try {
+    const reg = await navigator.serviceWorker.getRegistration(), sub = await reg?.pushManager.getSubscription();
+    if (sub) { await supa.from('push_subscriptions').delete().eq('endpoint', sub.endpoint); await sub.unsubscribe(); }
+  } catch (e) {}
+  pushState.subscribed = false; softRender(); toast('Notifications are off for this device');
+}
+async function testPush() {
+  if (!user) return;
+  const { error } = await supa.from('reminders').upsert({ user_id: user.id, id: 'test:' + Date.now(), fire_at: new Date().toISOString(), title: 'Almanac', body: 'Notifications are working.', url: '/', sent_at: null });
+  if (error) { toast('Couldn’t send a test. Try again.'); return; }
+  fetch('/api/reminders', { method: 'POST' }).then(r => r.json()).then(j => toast(j.sent ? 'Test sent' : 'Test is on its way')).catch(() => toast('Test is on its way'));
+}
+function renderReminderSettings() {
+  const P = remPrefs();
+  let h = `<section class="panel stack"><h2 class="sec" style="margin:0">Reminders</h2>`;
+  if (!user) return h + `<p class="muted" style="margin:0">Sign in to get reminders on your phone and computer.</p></section>`;
+  if (!pushSupported()) h += `<p class="muted" style="margin:0">${isIOS() && !standalone() ? 'On iPhone, add Almanac to your Home Screen first (Share → Add to Home Screen), then open it from there to turn on notifications.' : 'This browser can’t show notifications.'}</p>`;
+  else if (!pushState.subscribed) h += setRow('Notifications on this device', isIOS() && !standalone() ? 'On iPhone, open Almanac from your Home Screen to turn these on.' : 'Each phone or computer you use needs this once.', `<button class="btn primary" data-act="push-on"${pushState.busy ? ' disabled' : ''}>${pushState.busy ? 'Turning on…' : 'Turn on'}</button>`);
+  else h += setRow('Notifications on this device', 'On. Reminders also go to any other device you turned on.', `<span class="m-row"><button class="btn" data-act="push-test">Send a test</button><button class="btn ghost" data-act="push-off">Turn off</button></span>`);
+  if (P.on) {
+    h += setRow('Event reminders', 'Choose “Remind me” on any event.', seg('rem-events', P.events ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]));
+    if (cycleOn()) {
+      h += setRow('Daily check-in nudge', 'A reminder to log how you feel.', `<span class="m-row">${P.checkin ? `<input type="time" id="rem-ctime" value="${esc(P.checkinTime)}" aria-label="Nudge time">` : ''}${seg('rem-checkin', P.checkin ? 'on' : 'off', [['on', 'On'], ['off', 'Off']])}</span>`);
+      h += setRow('Period heads-up', 'About 2 days before your predicted period.', seg('rem-period', P.period ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]));
+    }
+  }
+  return h + '</section>';
+}
 
 function curObj() {
   if (view.mode !== 'doc') return null;
@@ -1082,6 +1200,7 @@ function renderDoc() {
       ${k !== 'saved' ? `<label class="field"><span>Date</span><input type="date" id="f-date" data-f="date" value="${o.date}"></label>` : ''}
       <label class="field"><span>Start</span><input type="time" id="f-start" data-f="start" value="${o.start}"></label>
       <label class="field"><span>End</span><input type="time" id="f-end" data-f="end" value="${o.end}"></label>
+      ${k === 'event' ? `<label class="field"><span>Remind me</span><select id="f-remind" data-f="remind">${Object.entries(o.start ? REMIND_TIMED : REMIND_ALLDAY).map(([v, n]) => `<option value="${v}"${String(o.remind || '') === v ? ' selected' : ''}>${n}</option>`).join('')}</select></label>` : ''}
       ${k === 'event' && !o.seriesId ? `<label class="field"><span>Repeats</span><select id="f-rep" data-rep="freq"><option value="">Doesn’t repeat</option>${Object.entries(REPEATS).map(([v, n]) => `<option value="${v}"${o.repeat?.freq === v ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
       ${o.repeat ? `<label class="field"><span>Until</span><input type="date" id="f-until" data-rep="until" value="${esc(o.repeat.until || '')}" min="${o.date}"></label>` : ''}` : ''}
     </div>
@@ -1354,6 +1473,7 @@ function renderSettings() {
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">News</h2>${setRow('Show news on the Day view', 'The latest top stories from NPR, BBC News and The Guardian, updated every time you open the app.', seg('news-on', p.news !== false ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Workouts</h2>${setRow('Weight unit', 'Used on Workout pages.', seg('unit', db.unit, [['lb', 'lb'], ['kg', 'kg']]))}</section>`;
   h += renderCycleSettings();
+  h += renderReminderSettings();
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Import from Excel</h2><p class="muted" style="margin:0">Add events from an .xlsx or .csv file. Workouts use Date, Exercise, Sets, Reps, Weight; other calendars use Date, Title, Time, Notes. You can check the columns before anything is added. On a computer you can also drag the file onto Almanac. Sample sheets: <button class="linkish" data-act="sample" data-kind="workout">workouts</button>, <button class="linkish" data-act="sample" data-kind="events">other calendars</button>.</p><label class="btn" style="align-self:flex-start">Choose a spreadsheet<input type="file" data-imp-cal="" accept="${IMPORT_ACCEPT}" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Bring over your Year Planner</h2><p class="muted" style="margin:0">In the old Year Planner, choose <b>Export my data</b> to download a file, then choose it here. Calendars, events, templates, formats and exercises are added; nothing here is replaced.</p><label class="btn" style="align-self:flex-start">Choose file<input type="file" id="imp-file" accept="application/json,.json" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Put Almanac on your phone</h2>${standalone() ? '<p class="muted" style="margin:0">You’re using the installed app.</p>' : `${installEvt ? '<button class="btn primary" data-act="install" style="align-self:flex-start">Install Almanac</button>' : ''}<p class="muted" style="margin:0"><b>iPhone:</b> open this site in Safari, tap the Share button, then <b>Add to Home Screen</b>.<br><b>Android:</b> open the browser menu and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>`}</section>`;
@@ -1436,6 +1556,10 @@ document.addEventListener('click', ev => {
       softRender(); break;
     }
     case 'cy-sym': { const d = view.date, cur = new Set(cyc.logs[d]?.symptoms || []); cur.has(ds.v) ? cur.delete(ds.v) : cur.add(ds.v); setLog(d, { symptoms: [...cur] }); softRender(); break; }
+    case 'push-on': enablePush(); break;
+    case 'push-off': disablePush(); break;
+    case 'push-test': testPush(); break;
+    case 'rem-events': case 'rem-checkin': case 'rem-period': db.prefs.reminders = { ...remPrefs(), [a.slice(4)]: ds.v === 'on' }; save(); render(); break;
     case 'cy-open': cycOpen = !cycOpen; softRender(); break;
     case 'cy-del': confirmCycleDel = true; render(); break;
     case 'cy-del-cancel': confirmCycleDel = false; render(); break;
@@ -1618,6 +1742,7 @@ document.addEventListener('click', ev => {
 /* ---------- typing ---------- */
 document.addEventListener('input', ev => {
   const t = ev.target, ds = t.dataset;
+  if (t.id === 'rem-ctime' && t.value) { db.prefs.reminders = { ...remPrefs(), checkinTime: t.value }; save(); return; }
   if (t.id === 'cy-last' && t.value) { cyc.settings = { ...cyc.settings, lastStart: t.value }; saveCycle([], true); return; }
   if (t.id === 'cy-len' || t.id === 'cy-plen') { cyc.settings = { ...cyc.settings, [t.id === 'cy-len' ? 'cycleLength' : 'periodLength']: t.value ? +t.value : null }; saveCycle([], true); return; }
   if (t.id === 'pf-name') { saveProfileSoon({ display_name: t.value }); return; }
@@ -1653,6 +1778,7 @@ document.addEventListener('input', ev => {
     if (ds.f === 'date' && !t.value) return;
     o[ds.f] = t.value;
     if (ds.f === 'date') view.date = t.value;
+    if (ds.f === 'start' && o.remind) { if (t.value && String(o.remind).startsWith('am')) o.remind = '0'; if (!t.value && !String(o.remind).startsWith('am')) o.remind = 'am0'; }
     if (ds.f === 'format') o.data = { ...blankData(t.value), ...o.data };
     save();
     return;
@@ -1688,9 +1814,9 @@ document.addEventListener('input', ev => {
 // so redrawing then would close the picker; those wait until the field loses focus.
 document.addEventListener('change', ev => {
   const t = ev.target, f = t.dataset.f;
-  if (view.mode !== 'doc' || f === 'start' || f === 'end' || !(['format', 'calId', 'date'].includes(f) || t.dataset.rep)) return;
+  if (view.mode !== 'doc' || f === 'end' || !(['format', 'calId', 'date', 'start'].includes(f) || t.dataset.rep)) return;
   const redraw = () => { if (view.mode !== 'doc') return; const y = scrollY; render(); scrollTo(0, y); };
-  if (t.type === 'date' && document.activeElement === t) { if (!t.dataset.waiting) { t.dataset.waiting = '1'; t.addEventListener('blur', redraw, { once: true }); } return; }
+  if ((t.type === 'date' || t.type === 'time') && document.activeElement === t) { if (!t.dataset.waiting) { t.dataset.waiting = '1'; t.addEventListener('blur', redraw, { once: true }); } return; }
   redraw();
 });
 
@@ -1715,6 +1841,8 @@ applyTheme();
 {
   const q = new URLSearchParams(location.hash.slice(1) + '&' + location.search.slice(1));
   const err = q.get('error_description');
+  const dayLink = new URLSearchParams(location.search).get('day');
+  if (dayLink && /^\d{4}-\d{2}-\d{2}$/.test(dayLink)) { view = { mode: 'day', date: dayLink }; history.replaceState(null, '', location.pathname); }
   if (err) setTimeout(() => toast(/expired|invalid/i.test(err) ? 'That sign-in link expired. Request a new one.' : err), 300);
 }
 supa.auth.getSession().then(({ data }) => {
