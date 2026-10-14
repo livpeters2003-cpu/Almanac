@@ -454,3 +454,21 @@ svg.ic.rep { width: 12px; height: 12px; margin-left: auto; color: var(--muted) !
   .bar-in > .seg, .bar-in > .btn:not(#m-settings) { order: 2; }
   #new-btn { margin-left: auto; }
 }
+
+/* import from Excel */
+.im-map { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 10px; }
+.im-map label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 600; }
+.im-map em { font-style: normal; font-weight: 500; color: var(--muted); font-size: 12px; }
+.im-map select { width: 100%; }
+.im-sum { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; background: var(--bg); }
+.im-sum p { font-size: 14px; }
+.im-warn { color: var(--danger, #c92a2a) !important; font-weight: 500; }
+.im-dup { display: flex; gap: 8px; align-items: center; font-size: 14px; }
+.im-prev { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.im-prev li { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; font-size: 14px; }
+.im-prev li b { font-weight: 600; white-space: nowrap; }
+.im-prev li small { grid-column: 1 / -1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.im-hint { margin: -6px 0 16px; font-size: 14px; }
+.toast { display: flex; align-items: center; gap: 14px; }
+.toast-act { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; padding: 0; cursor: pointer; }
+body.dropping::after { content: 'Drop your spreadsheet to import it'; position: fixed; inset: 12px; z-index: 50; border: 3px dashed var(--accent); border-radius: 18px; background: color-mix(in srgb, var(--bg) 88%, transparent); display: grid; place-items: center; font: 700 22px/1.2 var(--f-display); color: var(--ink); pointer-events: none; }

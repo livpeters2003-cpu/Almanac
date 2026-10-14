@@ -2,6 +2,7 @@ import './styles.css';
 import { createClient } from '@supabase/supabase-js';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 import { holidaysFor, COUNTRIES } from './holidays.js';
+import { readTable, prepare, planWorkouts, planEvents, FIELDS, SAMPLE_CSV } from './importer.js';
 
 /* ---------- constants ---------- */
 const WD = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
@@ -382,7 +383,11 @@ function curObj() {
   return (view.kind === 'saved' ? db.saved : db.events).find(x => x.id === view.id);
 }
 let toastT;
-function toast(msg) { const t = $('toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), 2400); }
+function toast(msg, action) {
+  const t = $('toast'); t.textContent = msg; t.hidden = false;
+  if (action) { const b = document.createElement('button'); b.className = 'toast-act'; b.dataset.act = action.act; b.textContent = action.label; t.append(b); }
+  clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), action ? 8000 : 2400);
+}
 
 /* ---------- workout helpers ---------- */
 const exInfo = x => { const l = db.exercises.find(e => e.id === x.exId); return { name: l?.name || x.name || 'Exercise', kind: l?.kind || x.kind || 'weight', muscle: l?.muscle || x.muscle || '', equipment: l?.equipment || '' }; };
@@ -573,14 +578,16 @@ function exList() {
 /* ---------- calendars ---------- */
 function renderCalendars() {
   const fmtOpts = fmtOptions;
-  let h = `<div class="page"><h1>Calendars</h1><p class="lede">Each calendar has its own color and a default format from the Library. New events in that calendar open in that format, and you can switch any single event to another one.</p><div class="stack">`;
+  let h = `<div class="page"><h1>Calendars</h1><p class="lede">Each calendar has its own color and a default format from the Library. New events in that calendar open in that format, and you can switch any single event to another one.</p>
+  ${db.calendars.length ? `<p class="muted im-hint">To fill a calendar from a spreadsheet, choose <b>Import from Excel</b> or drag an .xlsx or .csv file onto it. Workouts use the columns Date, Exercise, Sets, Reps, Weight; other calendars use Date, Title, Time, Notes. Sample sheets: <button class="linkish" data-act="sample" data-kind="workout">workouts</button>, <button class="linkish" data-act="sample" data-kind="events">other calendars</button>.</p>` : ''}<div class="stack">`;
   for (const c of db.calendars) {
     const n = db.events.filter(e => e.calId === c.id).length;
-    h += `<div class="panel calrow" style="--c:${okColor(c.color)}"><div class="fields">
+    h += `<div class="panel calrow" style="--c:${okColor(c.color)}" data-drop-cal="${c.id}"><div class="fields">
       <label class="field" style="flex:1 1 180px"><span>Name</span><input data-cal="${c.id}" data-cf="name" value="${esc(c.name)}" placeholder="Calendar name"></label>
       <label class="field" style="flex:1 1 140px"><span>Default format</span><select data-cal="${c.id}" data-cf="format">${fmtOpts(c.format)}</select></label>
       <div class="field"><span>Color</span><div class="swatches">${SWATCHES.map(s => `<button class="sw" style="--c:${s}" data-act="cal-color" data-id="${c.id}" data-color="${s}" aria-pressed="${s === c.color}" aria-label="Color ${s}"></button>`).join('')}</div></div>
     </div><div class="grp" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="muted">${n} event${n === 1 ? '' : 's'}</span>
+      <label class="btn">Import from Excel<input type="file" data-imp-cal="${c.id}" accept="${IMPORT_ACCEPT}" hidden></label>
       ${confirmCal === c.id ? `<button class="btn" data-act="cal-del-cancel">Keep</button><button class="btn danger solid" data-act="cal-del-confirm" data-id="${c.id}">Delete calendar${n ? ` and ${n} event${n > 1 ? 's' : ''}` : ''}</button>` : `<button class="btn danger" data-act="cal-del" data-id="${c.id}">Delete</button>`}
     </div></div>`;
   }
@@ -794,7 +801,7 @@ function renderModal() {
   const el = $('modal');
   if (!modal) { el.hidden = true; return; }
   el.hidden = false;
-  $('sheet').innerHTML = modal.type === 'new' ? renderNew() : renderPicker();
+  $('sheet').innerHTML = modal.type === 'new' ? renderNew() : modal.type === 'import' ? renderImport() : renderPicker();
 }
 function renderNew() {
   if (!db.calendars.length) return `<h2>Create a calendar first</h2><p>Every event lives on one of your calendars. Make one, like “Workouts” or “Family”, and pick its color and default format.</p><div class="m-actions"><button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="mode" data-mode="calendars">Create a calendar</button></div>`;
@@ -822,6 +829,114 @@ function pickList() {
   if (!rows.length && !q) h += `<div class="empty" style="border:0">No exercises for this muscle yet.</div>`;
   return h + '</div>';
 }
+
+/* ---------- import from Excel or CSV ---------- */
+const IMPORT_ACCEPT = '.xlsx,.csv,.tsv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv';
+const importKind = cal => cal?.format === 'workout' ? 'workout' : 'events';
+let lastImport = null;
+async function startImport(file, calId) {
+  if (!file) return;
+  if (!db.calendars.length) { modal = { type: 'import', none: true }; renderModal(); return; }
+  modal = { type: 'import', busy: true, fileName: file.name }; renderModal();
+  try {
+    const { sheets } = await readTable(file);
+    const usable = sheets.filter(sh => sh.rows.length);
+    if (!usable.length) throw Object.assign(new Error('empty'), { code: 'empty' });
+    let cal = db.calendars.find(c => c.id === calId);
+    if (!cal) {   // dropped anywhere: pick a calendar from what the sheet looks like
+      const looksWorkout = prepare(usable[0].rows, 'workout').map.exercise !== undefined;
+      const fits = c => (importKind(c) === 'workout') === looksWorkout;
+      cal = db.calendars.find(c => !c.hidden && fits(c)) || db.calendars.find(fits) || db.calendars[0];
+    }
+    modal = { type: 'import', fileName: file.name, sheets: usable, sheet: 0, calId: cal.id, skipDupes: true };
+    prepImport();
+  } catch (e) {
+    modal = null;
+    toast(e?.code === 'old-xls' ? 'That’s an old .xls file. In Excel, choose Save As → .xlsx, then try again.' : e?.code === 'empty' ? 'That sheet looks empty' : 'Couldn’t read that file. Use an .xlsx or .csv file.');
+  }
+  renderModal();
+}
+function prepImport() {
+  const cal = db.calendars.find(c => c.id === modal.calId), kind = importKind(cal);
+  Object.assign(modal, { kind }, prepare(modal.sheets[modal.sheet].rows, kind));
+}
+function importPlan() {
+  const m = modal, cal = db.calendars.find(c => c.id === m.calId);
+  if (FIELDS[m.kind].some(([f, , req]) => req && m.map[f] === undefined)) return null;
+  return m.kind === 'workout'
+    ? planWorkouts(m, { cal, db, today: todayS(), uid, skipDupes: m.skipDupes, starter: STARTER.map(([name, muscle, equipment, kind]) => ({ name, muscle, equipment, kind: kind || 'weight' })) })
+    : planEvents(m, { cal, db, uid, blankData, skipDupes: m.skipDupes, notesKey: (f, d) => 'notes' in d ? 'notes' : customOf(f)?.blocks.find(b => b.type === 'notes')?.id || null });
+}
+const rangeText = r => r ? (r[0] === r[1] ? shortDate(parse(r[0])) : `${shortDate(parse(r[0]))} – ${shortDate(parse(r[1]))}${r[0].slice(0, 4) !== r[1].slice(0, 4) ? ' ' + r[1].slice(0, 4) : ''}`) : '';
+function importPreviewLine(e) {
+  const when = `${parse(e.date).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}${e.start ? ' · ' + fmtTime(e.start) : ''}`;
+  const what = e.format === 'workout' ? e.data.exercises.map(x => { const s = x.sets[0]; return `${x.name} ${x.sets.length}×${s?.b || '?'}${s?.a ? ` @ ${s.a}` : ''}`; }).join(', ') : (e.data.notes || '');
+  return `<li><b>${esc(when)}</b><span>${esc(e.title || 'Untitled')}</span>${what ? `<small>${esc(what)}</small>` : ''}</li>`;
+}
+function renderImport() {
+  const m = modal;
+  if (m.none) return `<h2>Create a calendar first</h2><p>Imported events go onto one of your calendars. Make one, like “Workouts” or “Family”, then import again.</p><div class="m-actions"><button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="mode" data-mode="calendars">Create a calendar</button></div>`;
+  if (m.busy) return `<h2>Reading ${esc(m.fileName || 'your file')}…</h2>`;
+  const cal = db.calendars.find(c => c.id === m.calId), plan = importPlan(), workout = m.kind === 'workout';
+  const opts = cur => `<option value="">Not in this sheet</option>` + m.headers.map((h, i) => `<option value="${i}"${i === cur ? ' selected' : ''}>${esc(h)}</option>`).join('');
+  let h = `<h2>Import ${esc(m.fileName)}</h2>
+    <div class="field"><span>Add to calendar</span><div class="pick">${db.calendars.map(c => `<button data-act="im-cal" data-id="${c.id}" aria-pressed="${c.id === m.calId}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name || 'Untitled')}</button>`).join('')}</div></div>
+    ${m.sheets.length > 1 ? `<label class="field"><span>Sheet</span><select id="im-sheet">${m.sheets.map((sh, i) => `<option value="${i}"${i === m.sheet ? ' selected' : ''}>${esc(sh.name)}</option>`).join('')}</select></label>` : ''}
+    <div class="field"><span>Columns</span><p class="muted" style="margin:0 0 6px">${workout ? `${esc(cal.name)} uses Workout pages, so each date becomes one workout. Rows can be one per exercise (with a Sets count) or one per set.` : 'Each row becomes one event.'} Check these match your sheet.</p>
+    <div class="im-map">${FIELDS[m.kind].map(([f, label, req]) => `<label><span>${label}${req ? ' <em>required</em>' : ''}</span><select data-im="${f}">${opts(m.map[f])}</select></label>`).join('')}</div></div>`;
+  if (!plan) {
+    const miss = FIELDS[m.kind].filter(([f, , req]) => req && m.map[f] === undefined).map(([, l]) => l);
+    h += `<p class="im-warn">Choose which column has the ${miss.join(' and ').toLowerCase()}.</p>`;
+  } else {
+    const n = plan.events.length, sets = workout ? plan.events.reduce((t, e) => t + e.data.exercises.reduce((u, x) => u + x.sets.length, 0), 0) : 0;
+    h += `<div class="im-sum"><b>${n ? `Adds ${n} ${workout ? `workout${n === 1 ? '' : 's'} with ${sets} set${sets === 1 ? '' : 's'}` : `event${n === 1 ? '' : 's'}`} to ${esc(cal.name)}, ${rangeText(plan.range)}` : 'Nothing new to add'}</b>`;
+    if (plan.newExercises.length) h += `<p>Adds ${plan.newExercises.length} new exercise${plan.newExercises.length === 1 ? '' : 's'} to your library: ${esc(plan.newExercises.slice(0, 6).map(e => e.name).join(', '))}${plan.newExercises.length > 6 ? ', …' : ''}. You can set ${plan.newExercises.length === 1 ? 'its' : 'their'} muscle group later under Library → Exercises.</p>`;
+    if (plan.skipped.length) h += `<p>${plan.skipped.length} row${plan.skipped.length === 1 ? ' is' : 's are'} skipped because ${plan.skipped.length === 1 ? 'it has' : 'they have'} ${[...new Set(plan.skipped.map(x => x.why))].join(' or ')}.</p>`;
+    if (plan.dupes) h += `<label class="im-dup"><input type="checkbox" id="im-dupes" ${m.skipDupes ? 'checked' : ''}> Skip ${plan.dupes} ${workout ? `day${plan.dupes === 1 ? '' : 's'} that already ${plan.dupes === 1 ? 'has' : 'have'} a workout` : `event${plan.dupes === 1 ? '' : 's'} already on this calendar`}</label>`;
+    if (n) h += `<ul class="im-prev">${plan.events.slice(0, 4).map(importPreviewLine).join('')}${n > 4 ? `<li class="muted">and ${n - 4} more</li>` : ''}</ul>`;
+    h += '</div>';
+  }
+  return h + `<div class="m-actions"><button class="btn" data-act="m-close">Cancel</button><button class="btn primary" data-act="im-go" ${plan?.events.length ? '' : 'disabled'}>Import${plan?.events.length ? ' ' + plan.events.length : ''}</button></div>`;
+}
+function doImport() {
+  const plan = importPlan(); if (!plan?.events.length) return;
+  const cal = db.calendars.find(c => c.id === modal.calId), kind = modal.kind;
+  db.exercises.push(...plan.newExercises);
+  db.events.push(...plan.events);
+  lastImport = { ids: plan.events.map(e => e.id), exIds: plan.newExercises.map(e => e.id) };
+  save(); modal = null;
+  view = { ...view, date: plan.events[0].date };
+  render();
+  const n = plan.events.length;
+  toast(`Imported ${n} ${kind === 'workout' ? 'workout' : 'event'}${n === 1 ? '' : 's'} into ${cal.name || 'your calendar'}`, { label: 'Undo', act: 'im-undo' });
+}
+function undoImport() {
+  if (!lastImport) return;
+  const ids = new Set(lastImport.ids), exIds = new Set(lastImport.exIds);
+  db.events = db.events.filter(e => !ids.has(e.id));
+  const used = new Set(db.events.flatMap(e => e.format === 'workout' ? (e.data?.exercises || []).map(x => x.exId) : []));
+  db.exercises = db.exercises.filter(e => !exIds.has(e.id) || used.has(e.id));
+  lastImport = null; save(); render(); $('toast').hidden = true; toast('Import undone');
+}
+function downloadSample(kind) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([SAMPLE_CSV[kind]], { type: 'text/csv' }));
+  a.download = kind === 'workout' ? 'almanac-workouts-sample.csv' : 'almanac-events-sample.csv';
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+// Drag a spreadsheet anywhere onto the page to import it.
+const hasFiles = ev => [...(ev.dataTransfer?.types || [])].includes('Files');
+let dragDepth = 0;
+window.addEventListener('dragenter', ev => { if (!hasFiles(ev) || view.mode === 'welcome') return; ev.preventDefault(); dragDepth++; document.body.classList.add('dropping'); });
+window.addEventListener('dragover', ev => { if (hasFiles(ev)) ev.preventDefault(); });
+window.addEventListener('dragleave', ev => { if (!hasFiles(ev)) return; if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); } });
+window.addEventListener('drop', ev => {
+  if (!hasFiles(ev)) return;
+  ev.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
+  if (view.mode === 'welcome') return;
+  const f = ev.dataTransfer.files[0], target = ev.target.closest?.('[data-drop-cal]');
+  startImport(f, target?.dataset.dropCal || (view.mode === 'doc' && view.kind === 'event' ? curObj()?.calId : ''));
+});
 
 /* ---------- sign in ---------- */
 let auth = { email: '', sent: false, busy: false, err: '' };
@@ -880,6 +995,7 @@ function renderSettings() {
     <div class="field"><span>Countries</span><div class="pick">${Object.entries(COUNTRIES).map(([c, n]) => `<button data-act="hol-cc" data-v="${c}" aria-pressed="${cc.includes(c)}">${esc(n)}</button>`).join('')}</div></div></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">News</h2>${setRow('Show news on the Day view', 'The latest top stories from NPR, BBC News and The Guardian, updated every time you open the app.', seg('news-on', p.news !== false ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Workouts</h2>${setRow('Weight unit', 'Used on Workout pages.', seg('unit', db.unit, [['lb', 'lb'], ['kg', 'kg']]))}</section>`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">Import from Excel</h2><p class="muted" style="margin:0">Add events from an .xlsx or .csv file. Workouts use Date, Exercise, Sets, Reps, Weight; other calendars use Date, Title, Time, Notes. You can check the columns before anything is added. On a computer you can also drag the file onto Almanac. Sample sheets: <button class="linkish" data-act="sample" data-kind="workout">workouts</button>, <button class="linkish" data-act="sample" data-kind="events">other calendars</button>.</p><label class="btn" style="align-self:flex-start">Choose a spreadsheet<input type="file" data-imp-cal="" accept="${IMPORT_ACCEPT}" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Bring over your Year Planner</h2><p class="muted" style="margin:0">In the old Year Planner, choose <b>Export my data</b> to download a file, then choose it here. Calendars, events, templates, formats and exercises are added; nothing here is replaced.</p><label class="btn" style="align-self:flex-start">Choose file<input type="file" id="imp-file" accept="application/json,.json" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Put Almanac on your phone</h2>${standalone() ? '<p class="muted" style="margin:0">You’re using the installed app.</p>' : `${installEvt ? '<button class="btn primary" data-act="install" style="align-self:flex-start">Install Almanac</button>' : ''}<p class="muted" style="margin:0"><b>iPhone:</b> open this site in Safari, tap the Share button, then <b>Add to Home Screen</b>.<br><b>Android:</b> open the browser menu and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>`}</section>`;
   return h + '</div></div>';
@@ -966,6 +1082,10 @@ document.addEventListener('click', ev => {
 
     /* modal: new event */
     case 'm-close': modal = null; renderModal(); break;
+    case 'im-cal': modal.calId = ds.id; prepImport(); renderModal(); break;
+    case 'im-go': doImport(); break;
+    case 'im-undo': undoImport(); break;
+    case 'sample': downloadSample(ds.kind); break;
     case 'nm-cal': { const c = db.calendars.find(x => x.id === ds.id); modal.calId = c.id; if (!modal.savedId) modal.format = c.format; renderModal(); break; }
     case 'nm-fmt': modal.format = ds.fmt; modal.savedId = ''; renderModal(); break;
     case 'nm-saved': modal.savedId = ds.id; renderModal(); break;
@@ -1099,6 +1219,11 @@ document.addEventListener('click', ev => {
 /* ---------- typing ---------- */
 document.addEventListener('input', ev => {
   const t = ev.target, ds = t.dataset;
+  if (modal?.type === 'import') {
+    if (t.id === 'im-sheet') { modal.sheet = +t.value; prepImport(); renderModal(); return; }
+    if (ds.im) { if (t.value === '') delete modal.map[ds.im]; else { for (const k in modal.map) if (modal.map[k] === +t.value) delete modal.map[k]; modal.map[ds.im] = +t.value; } renderModal(); return; }
+    if (t.id === 'im-dupes') { modal.skipDupes = t.checked; renderModal(); return; }
+  }
   if (t.id === 'nm-date') { if (t.value) modal.date = t.value; return; }
   if (t.id === 'nm-rep') { modal.rep = t.value; renderModal(); return; }
   if (t.id === 'nm-until') { modal.until = t.value; return; }
@@ -1172,7 +1297,11 @@ document.addEventListener('submit', ev => {
   if (f.dataset.form === 'send') { const email = $('au-email').value.trim(); if (email) sendLink(email); }
   if (f.dataset.form === 'verify') { const code = $('au-code').value.trim(); if (code) verifyCode(code); }
 });
-document.addEventListener('change', ev => { if (ev.target.id === 'imp-file' && ev.target.files?.[0]) importFile(ev.target.files[0]); });
+document.addEventListener('change', ev => {
+  const t = ev.target;
+  if (t.id === 'imp-file' && t.files?.[0]) importFile(t.files[0]);
+  if (t.dataset.impCal !== undefined && t.files?.[0]) { startImport(t.files[0], t.dataset.impCal); t.value = ''; }
+});
 
 /* ---------- start ---------- */
 try { guestMode = localStorage.getItem('almanac-guest') === '1'; } catch (e) {}
