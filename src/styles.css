@@ -508,3 +508,20 @@ body.dropping::after { content: 'Drop your spreadsheet to import it'; position: 
 .bills-l button span:first-child { color: var(--muted); font-size: 13px; }
 .bills-l button em { font-style: normal; font-size: 12px; color: var(--muted); }
 .bills-l button.paid b { text-decoration: line-through; color: var(--muted); }
+
+/* friends */
+.chip .who { font-style: normal; font-weight: 700; }
+.ro-doc h1.ttl.ro { margin: 0; }
+.ro-when { margin: 4px 0 0; color: var(--d-muted, var(--muted)); font-size: 14px; }
+fieldset.ro { border: 0; padding: 0; margin: 0; min-width: 0; }
+fieldset.ro :disabled { opacity: 1; color: inherit; -webkit-text-fill-color: currentColor; cursor: default; }
+fieldset.ro .li-add, fieldset.ro .li-del, fieldset.ro .w-add, fieldset.ro .w-addset, fieldset.ro .w-x, fieldset.ro .w-del { display: none; }
+fieldset.ro input::placeholder, fieldset.ro textarea::placeholder { color: transparent; }
+.ro-note { margin: 22px 0 0; padding-top: 14px; border-top: 1px solid var(--d-line, var(--line)); color: var(--d-muted, var(--muted)); font-size: 14px; }
+.frow { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.friend { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; border-top: 1px solid var(--line); }
+.friend:first-of-type { border-top: 0; padding-top: 0; }
+.share-ctl .seg button { padding: 5px 10px; font-size: 13px; }
+.invite-note { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); border-radius: 10px; padding: 10px 12px; color: var(--ink) !important; font-weight: 500; }
+#inv-link { font: 13px var(--f-mono); }
+.panel .inrow > input, .panel .m-row > select { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 8px; padding: 8px 10px; min-width: 0; }

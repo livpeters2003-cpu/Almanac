@@ -168,8 +168,8 @@ let ready = false;
 const TABLES = {
   calendars: {
     table: 'calendars',
-    toRow: (c, i) => ({ id: c.id, user_id: user.id, body: { name: c.name || '', color: c.color, format: c.format, hidden: !!c.hidden }, sharing: c.sharing === 'friends' ? 'friends' : 'private', position: i }),
-    fromRow: r => ({ id: r.id, ...r.body, sharing: r.sharing }),
+    toRow: (c, i) => ({ id: c.id, user_id: user.id, body: { name: c.name || '', color: c.color, format: c.format, hidden: !!c.hidden, ...(c.sharing === 'friends' ? { formats: sharedFormats(c) } : {}) }, sharing: c.sharing === 'friends' ? 'friends' : 'private', position: i }),
+    fromRow: r => { const { formats, ...body } = r.body || {}; return { id: r.id, ...body, sharing: r.sharing }; },
     order: 'position',
   },
   events: {
@@ -185,6 +185,11 @@ const TABLES = {
     order: 'id',
   },
 };
+// The custom formats a shared calendar uses, so friends see those pages laid out the same way.
+function sharedFormats(c) {
+  const ids = new Set([c.format, ...db.events.filter(e => e.calId === c.id).map(e => e.format)].filter(isCustom));
+  return db.formats.filter(f => ids.has('c:' + f.id)).map(({ fresh, ...f }) => f);
+}
 const settingsRow = () => ({ user_id: user.id, unit: db.unit, exercises: db.exercises, formats: db.formats, prefs: db.prefs });
 function setStatus(s) {
   const el = document.getElementById('sync-status'); if (!el) return;
@@ -293,10 +298,14 @@ const pullSoon = () => { clearTimeout(pullTimer); pullTimer = setTimeout(pull, 4
 function listen() {
   if (channel) supa.removeChannel(channel);
   channel = supa.channel('almanac-' + user.id);
-  for (const table of ['planner_settings', 'calendars', 'events', 'templates']) channel.on('postgres_changes', { event: '*', schema: 'public', table }, () => { if (!syncing) pullSoon(); });
+  for (const table of ['planner_settings', 'calendars', 'events', 'templates']) channel.on('postgres_changes', { event: '*', schema: 'public', table }, p => {
+    const owner = p.new?.user_id || p.old?.user_id;
+    if (owner && owner !== user?.id) loadSocialSoon(); else if (!syncing) pullSoon();
+  });
+  for (const table of ['friend_requests', 'profiles']) channel.on('postgres_changes', { event: '*', schema: 'public', table }, loadSocialSoon);
   channel.subscribe();
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) pullSoon(); loadNews(); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) { pullSoon(); loadSocialSoon(); } loadNews(); } });
 window.addEventListener('online', () => { if (user) { pullSoon(); flush(); } });
 
 function startSession(u) {
@@ -310,13 +319,14 @@ function startSession(u) {
   synced = { settings: null, calendars: {}, events: {}, saved: {} }; ready = false;
   persistLocal(); applyTheme(); setStatus('checking');
   if (view.mode === 'welcome') view = { mode: 'week', date: todayS() };
-  render(); pull(); listen(); loadNews();
+  restoreSocial();
+  render(); pull(); listen(); loadNews(); loadSocial().then(useInvite);
 }
 function endSession() {
   if (channel) { supa.removeChannel(channel); channel = null; }
   user = null; ready = false; owner = GUEST; db = loadLocal(GUEST);
   synced = { settings: null, calendars: {}, events: {}, saved: {} };
-  news = {}; applyTheme();
+  news = {}; social = { me: null, requests: [], people: {}, cals: [], events: [] }; fcCache = feCache = null; applyTheme();
 }
 
 /* ---------- state ---------- */
@@ -328,8 +338,8 @@ let libTab = 'formats', libQ = '', libMuscle = '';
 let newCal = { color: SWATCHES[0], format: 'notes' };
 
 const $ = id => document.getElementById(id);
-const calOf = o => db.calendars.find(c => c.id === o.calId);
-const visibleEvents = () => db.events.filter(e => { const c = calOf(e); return c && !c.hidden; });
+const calOf = o => o._friend ? friendCals().find(c => c.id === o.calId) : db.calendars.find(c => c.id === o.calId);
+const visibleEvents = () => [...db.events, ...friendEvents()].filter(e => { const c = calOf(e); return c && !c.hidden; });
 /* ---------- repeating events ---------- */
 // A repeating event is stored once with a `repeat` rule. Its later dates are drawn from the rule;
 // opening one of them turns that day into its own event (so a workout's sets are tracked per day).
@@ -404,9 +414,134 @@ function holidayMap() {
   return m;
 }
 const holChip = h => `<span class="hol" style="--c:${HOLIDAY_COLOR}" title="${esc(h.name)}">${esc(h.name)}</span>`;
+/* ---------- friends (profiles, requests, and the calendars friends share) ---------- */
+// Kept in memory and cached on the device; friends' calendars are read only.
+let social = { me: null, requests: [], people: {}, cals: [], events: [] }, socialTimer = null, fcCache = null, feCache = null;
+const socialKey = () => `almanac-social:${user?.id}`;
+function setSocial(next) {
+  social = next; fcCache = feCache = null;
+  try { localStorage.setItem(socialKey(), JSON.stringify(social)); } catch (e) {}
+}
+const friendIds = () => social.requests.filter(r => r.status === 'accepted').map(r => r.from_id === user?.id ? r.to_id : r.from_id);
+const personName = id => social.people[id]?.display_name || 'Friend';
+const firstName = id => personName(id).split(/\s+/)[0];
+const fKey = (uid_, id) => `f:${uid_}:${id}`;
+function friendCals() {
+  if (fcCache) return fcCache;
+  const shown = db.prefs.friendCals || {};
+  return (fcCache = social.cals.map(r => ({ id: fKey(r.user_id, r.id), name: r.body?.name || 'Calendar', color: r.body?.color, format: r.body?.format, formats: r.body?.formats || [], owner: r.user_id, hidden: shown[fKey(r.user_id, r.id)] === false })));
+}
+function friendEvents() {
+  if (feCache) return feCache;
+  return (feCache = social.events.filter(r => r.body && typeof r.body.date === 'string').map(r => ({ ...r.body, id: fKey(r.user_id, r.body.id), calId: fKey(r.user_id, r.cal_id), _friend: r.user_id })));
+}
+const friendFormat = (o, f) => isCustom(f) ? (calOf(o)?.formats || []).find(x => 'c:' + x.id === f) || null : null;
+async function loadSocial() {
+  if (!user) return;
+  const me = user.id;
+  try {
+    const [prof, reqs, names] = await Promise.all([
+      supa.from('profiles').select('*').eq('id', me).maybeSingle(),
+      supa.from('friend_requests').select('*'),
+      supa.rpc('request_people'),
+    ]);
+    if (prof.error || reqs.error) throw prof.error || reqs.error;
+    if (!user || user.id !== me) return;
+    const requests = reqs.data || [], fids = requests.filter(r => r.status === 'accepted').map(r => r.from_id === me ? r.to_id : r.from_id);
+    const people = {};
+    for (const p of names.data || []) people[p.id] = p;
+    let cals = [], events = [];
+    if (fids.length) {
+      const [fp, fc] = await Promise.all([supa.from('profiles').select('*').in('id', fids), supa.from('calendars').select('*').in('user_id', fids).eq('sharing', 'friends').order('position')]);
+      if (fp.error || fc.error) throw fp.error || fc.error;
+      for (const p of fp.data || []) people[p.id] = p;
+      cals = fc.data || [];
+      for (let from = 0; cals.length; from += 1000) {
+        const { data, error } = await supa.from('events').select('*').in('user_id', fids).order('date').order('id').range(from, from + 999);
+        if (error) throw error;
+        events.push(...data);
+        if (data.length < 1000) break;
+      }
+    }
+    setSocial({ me: prof.data, requests, people, cals, events });
+    softRender();
+  } catch (e) {}
+}
+const loadSocialSoon = () => { clearTimeout(socialTimer); socialTimer = setTimeout(loadSocial, 500); };
+function restoreSocial() {
+  try { const c = JSON.parse(localStorage.getItem(socialKey())); if (c && Array.isArray(c.requests)) { social = { me: null, people: {}, cals: [], events: [], ...c }; fcCache = feCache = null; return; } } catch (e) {}
+  social = { me: null, requests: [], people: {}, cals: [], events: [] }; fcCache = feCache = null;
+}
+// Invite links look like https://…/?invite=CODE. The code waits on this device until you're signed in.
+const INVITE_KEY = 'almanac-invite';
+{
+  const q = new URLSearchParams(location.search), code = q.get('invite');
+  if (code && /^[a-z0-9]{6,20}$/i.test(code)) {
+    try { localStorage.setItem(INVITE_KEY, code); } catch (e) {}
+    q.delete('invite'); history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q : '') + location.hash);
+  }
+}
+const pendingInvite = () => { try { return localStorage.getItem(INVITE_KEY); } catch (e) { return null; } };
+async function useInvite() {
+  const code = pendingInvite(); if (!code || !user) return;
+  try { localStorage.removeItem(INVITE_KEY); } catch (e) {}
+  const { data, error } = await supa.rpc('friend_by_code', { p_code: code });
+  if (error) { toast('Couldn’t use that invite link. Try opening it again.'); return; }
+  const n = data?.name || 'your friend';
+  toast({ sent: `Friend request sent to ${n}`, friends: `You and ${n} are friends`, self: 'That’s your own invite link', not_found: 'That invite link isn’t valid anymore' }[data?.status] || 'Done');
+  loadSocial();
+}
+async function addFriendByEmail(email) {
+  const { error } = await supa.rpc('friend_by_email', { p_email: email });
+  if (error) { toast('Couldn’t send that. Try again.'); return false; }
+  toast('If they have Almanac, they’ll see your request. If not, send them your invite link.');
+  loadSocial(); return true;
+}
+async function friendAction(fn) { const { error } = await fn(); if (error) toast('That didn’t go through. Try again.'); loadSocial(); }
+let profileTimer = null;
+function saveProfileSoon(patch) {
+  if (!user || !social.me) return;
+  social.me = { ...social.me, ...patch }; setSocial(social);
+  clearTimeout(profileTimer);
+  profileTimer = setTimeout(async () => {
+    const { display_name, birthday_month, birthday_day } = social.me;
+    const { error } = await supa.from('profiles').update({ display_name, birthday_month, birthday_day }).eq('id', user.id);
+    if (error) toast('Couldn’t save your profile. Check your connection.');
+  }, 600);
+}
+// Friends' birthdays for the years around the one on screen.
+const birthdaysOn = () => db.prefs.birthdays !== false;
+const BDAY_COLOR = '#d6336c';
+function birthdayMap() {
+  if (!birthdaysOn() || !user) return {};
+  const y = parse(view.date).getFullYear(), m = {};
+  for (const id of friendIds()) {
+    const p = social.people[id]; if (!p?.birthday_month || !p?.birthday_day) continue;
+    for (const yr of [y - 1, y, y + 1]) {
+      const d = new Date(yr, p.birthday_month - 1, p.birthday_day);
+      if (d.getMonth() !== p.birthday_month - 1) continue;   // Feb 29 in other years
+      (m[iso(d)] || (m[iso(d)] = [])).push({ id, name: `${personName(id)}’s birthday` });
+    }
+  }
+  return m;
+}
+const bdayChip = b => `<span class="hol bday" style="--c:${BDAY_COLOR}" title="${esc(b.name)}">🎂 ${esc(b.name)}</span>`;
+// Days that have holidays or friends' birthdays, as one map of chips.
+function specialDays() {
+  const h = holidayMap(), b = birthdayMap(), m = {};
+  for (const k in h) m[k] = h[k].map(x => ({ ...x, kind: 'hol' }));
+  for (const k in b) (m[k] || (m[k] = [])).push(...b[k].map(x => ({ ...x, kind: 'bday' })));
+  return m;
+}
+const specialChip = x => x.kind === 'bday' ? bdayChip(x) : holChip(x);
+
 function curObj() {
   if (view.mode !== 'doc') return null;
   if (view.kind === 'preview') return preview;
+  if (view.kind === 'friend') {
+    const [fid, date] = String(view.id).split('@'), e = friendEvents().find(x => x.id === fid);
+    return e && date ? { ...e, id: view.id, date, _occ: e.id, ...(e.format === 'bill' ? { data: { ...e.data, paid: '' } } : {}) } : e;
+  }
   return (view.kind === 'saved' ? db.saved : db.events).find(x => x.id === view.id);
 }
 let toastT;
@@ -453,7 +588,7 @@ const money = v => { const n = typeof v === 'number' ? v : amountOf(v); return n
 // Every bill in a month (repeating bills included), from calendars that are showing.
 function monthBills(y, mo, map = byDate()) {
   const out = [], last = new Date(y, mo + 1, 0).getDate();
-  for (let d = 1; d <= last; d++) for (const e of map[iso(new Date(y, mo, d))] || []) if (e.format === 'bill') out.push(e);
+  for (let d = 1; d <= last; d++) for (const e of map[iso(new Date(y, mo, d))] || []) if (e.format === 'bill' && !e._friend) out.push(e);
   const total = out.reduce((t, e) => t + amountOf(e.data.amount), 0), paid = out.filter(e => e.data.paid === 'yes'), left = out.filter(e => e.data.paid !== 'yes');
   return { list: out, total, paid: paid.reduce((t, e) => t + amountOf(e.data.amount), 0), left };
 }
@@ -484,7 +619,7 @@ function summary(e) {
 
 /* ---------- header ---------- */
 function renderSub() {
-  for (const m of ['year', 'week', 'day', 'library', 'calendars', 'settings']) $('m-' + m).setAttribute('aria-pressed', view.mode === m || (m === 'library' && view.mode === 'builder'));
+  for (const m of ['year', 'week', 'day', 'library', 'calendars', 'friends', 'settings']) $('m-' + m).setAttribute('aria-pressed', view.mode === m || (m === 'library' && view.mode === 'builder'));
   if (!['year', 'week', 'day'].includes(view.mode)) { $('sub').hidden = true; return; }
   $('sub').hidden = false;
   const d = parse(view.date);
@@ -493,14 +628,14 @@ function renderSub() {
   if (view.mode === 'week') { const ws = startOfWeek(d), we = addDays(ws, 6); title = `<small>Week ${isoWeek(ws)}</small>${shortDate(ws)} – ${shortDate(we)}, ${we.getFullYear()}`; }
   if (view.mode === 'day') title = `<small>Week ${isoWeek(d)}</small>${longDate(d)}`;
   let h = `<h1>${title}</h1><div class="navs"><button class="btn icon" data-act="nav" data-dir="-1" aria-label="Previous">‹</button><button class="btn" data-act="today">Today</button><button class="btn icon" data-act="nav" data-dir="1" aria-label="Next">›</button></div>`;
-  h += `<div class="legend" aria-label="Show calendars">` + db.calendars.map(c => `<button data-act="cal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name || 'Untitled')}</button>`).join('') + `<button data-act="hol-toggle" aria-pressed="${holidaysOn()}" style="--c:${HOLIDAY_COLOR}"><span class="dot"></span>Holidays</button></div>`;
+  h += `<div class="legend" aria-label="Show calendars">` + db.calendars.map(c => `<button data-act="cal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name || 'Untitled')}</button>`).join('') + friendCals().map(c => `<button data-act="fcal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(firstName(c.owner))} · ${esc(c.name)}</button>`).join('') + `<button data-act="hol-toggle" aria-pressed="${holidaysOn()}" style="--c:${HOLIDAY_COLOR}"><span class="dot"></span>Holidays</button>${user && friendIds().length ? `<button data-act="bday-toggle" aria-pressed="${birthdaysOn()}" style="--c:${BDAY_COLOR}"><span class="dot"></span>Birthdays</button>` : ''}</div>`;
   $('sub').innerHTML = h;
 }
 const onboarding = () => db.calendars.length ? '' : `<div class="banner"><div><h2>Make your first calendar</h2><p>Calendars hold your events, like Workouts, School or Family. You choose the name, the color and which Library format its events use.</p></div><button class="btn primary" data-act="mode" data-mode="calendars">Create a calendar</button></div>`;
 
 /* ---------- year / week / day ---------- */
 function renderYear() {
-  const y = parse(view.date).getFullYear(), map = byDate(), hol = holidayMap(), t = todayS(), now = new Date();
+  const y = parse(view.date).getFullYear(), map = byDate(), hol = specialDays(), t = todayS(), now = new Date();
   let h = onboarding() + '<div class="year">';
   for (let mo = 0; mo < 12; mo++) {
     const first = new Date(y, mo, 1), last = new Date(y, mo + 1, 0);
@@ -514,7 +649,7 @@ function renderYear() {
         const d = addDays(ws, i), s = iso(d);
         if (d.getMonth() !== mo) { h += '<span class="d out"></span>'; continue; }
         const evs = map[s] || [], hs = hol[s] || [];
-        const dots = (hs.length ? `<i style="--c:${HOLIDAY_COLOR}"></i>` : '') + evs.slice(0, hs.length ? 2 : 3).map(e => `<i style="--c:${okColor(calOf(e).color)}"></i>`).join('');
+        const dots = (hs.length ? `<i style="--c:${hs.some(x => x.kind === 'hol') ? HOLIDAY_COLOR : BDAY_COLOR}"></i>` : '') + evs.slice(0, hs.length ? 2 : 3).map(e => `<i style="--c:${okColor(calOf(e).color)}"></i>`).join('');
         const label = longDate(d) + (hs.length ? `, ${hs.map(x => x.name).join(', ')}` : '') + (evs.length ? `, ${evs.length} event${evs.length > 1 ? 's' : ''}` : '');
         h += `<button class="d${s === t ? ' today' : ''}${i > 4 ? ' wkend' : ''}${hs.length ? ' hday' : ''}" data-act="day" data-date="${s}" title="${esc(hs.map(x => x.name).join(', '))}" aria-label="${esc(label)}">${d.getDate()}<span class="dots">${dots}</span></button>`;
       }
@@ -525,25 +660,25 @@ function renderYear() {
 }
 const REP_IC = '<svg class="ic rep" viewBox="0 0 24 24" aria-label="Repeats"><path d="M17 2.5 20.5 6 17 9.5M3.5 11V9.5A3.5 3.5 0 0 1 7 6h13.5M7 21.5 3.5 18 7 14.5M20.5 13v1.5A3.5 3.5 0 0 1 17 18H3.5"/></svg>';
 const isRep = e => !!(e._occ || (e.repeat && REPEATS[e.repeat.freq]));
-const chip = e => `<button class="chip" data-act="open" data-id="${e.id}" style="--c:${okColor(calOf(e).color)}"><span class="t">${icon(e.format)}${e.start ? fmtTime(e.start) : 'Any time'}${isRep(e) ? REP_IC : ''}</span><span class="n">${esc(e.title || 'Untitled')}</span></button>`;
+const chip = e => `<button class="chip" data-act="open" data-id="${e.id}" style="--c:${okColor(calOf(e).color)}"><span class="t">${icon(e.format)}${e.start ? fmtTime(e.start) : 'Any time'}${isRep(e) ? REP_IC : ''}</span><span class="n">${e._friend ? `<em class="who">${esc(firstName(e._friend))}</em> ` : ''}${esc(e.title || 'Untitled')}</span></button>`;
 function renderWeek() {
-  const ws = startOfWeek(parse(view.date)), map = byDate(), hol = holidayMap(), t = todayS(), vd = parse(view.date);
+  const ws = startOfWeek(parse(view.date)), map = byDate(), hol = specialDays(), t = todayS(), vd = parse(view.date);
   let h = onboarding() + billsBar(vd.getFullYear(), vd.getMonth(), map) + '<div class="week">';
   for (let i = 0; i < 7; i++) {
     const d = addDays(ws, i), s = iso(d);
-    h += `<div class="wday${s === t ? ' today' : ''}"><button class="wday-h" data-act="day" data-date="${s}" aria-label="Open ${esc(longDate(d))}"><b>${d.getDate()}</b><span>${WD[i]}${d.getDate() === 1 || i === 0 ? ' · ' + MONTHS[d.getMonth()].slice(0, 3) : ''}</span></button><div class="wday-l">${(hol[s] || []).map(holChip).join('')}${(map[s] || []).map(chip).join('')}<button class="add-mini" data-act="new" data-date="${s}">+ Add</button></div></div>`;
+    h += `<div class="wday${s === t ? ' today' : ''}"><button class="wday-h" data-act="day" data-date="${s}" aria-label="Open ${esc(longDate(d))}"><b>${d.getDate()}</b><span>${WD[i]}${d.getDate() === 1 || i === 0 ? ' · ' + MONTHS[d.getMonth()].slice(0, 3) : ''}</span></button><div class="wday-l">${(hol[s] || []).map(specialChip).join('')}${(map[s] || []).map(chip).join('')}<button class="add-mini" data-act="new" data-date="${s}">+ Add</button></div></div>`;
   }
   return h + '</div>';
 }
 function renderDay() {
-  const s = view.date, evs = byDate()[s] || [], hs = holidayMap()[s] || [];
+  const s = view.date, evs = byDate()[s] || [], hs = specialDays()[s] || [];
   let h = onboarding() + '<div class="day">';
-  if (hs.length) h += `<div class="hol-day">${hs.map(holChip).join('')}</div>`;
+  if (hs.length) h += `<div class="hol-day">${hs.map(specialChip).join('')}</div>`;
   if (db.calendars.length) h += '<div class="quick">' + db.calendars.map(c => `<button class="btn" data-act="new" data-cal="${c.id}" data-date="${s}" style="--c:${okColor(c.color)}"><span class="dot"></span>+ ${esc(c.name || 'Untitled')}</button>`).join('') + '</div>';
   if (!evs.length) h += `<div class="empty">Nothing planned for this day.${db.calendars.length ? ' Add something with the buttons above.' : ''}</div>`;
   for (const e of evs) {
     const c = calOf(e), sm = summary(e);
-    h += `<button class="card" data-act="open" data-id="${e.id}" style="--c:${okColor(c.color)}"><div class="time">${e.start ? `<b>${fmtTime(e.start)}</b>${e.end ? fmtTime(e.end) : ''}` : '<b>Any time</b>'}</div><div style="min-width:0"><h4>${esc(e.title || 'Untitled')}</h4>${sm ? `<p>${esc(sm)}</p>` : ''}${isRep(e) ? `<p class="rep-line">${REP_IC}${esc(repeatText(e._occ ? db.events.find(x => x.id === e._occ) || e : e))}</p>` : ''}</div><span class="tag">${icon(e.format)}${esc(c.name)}</span></button>`;
+    h += `<button class="card" data-act="open" data-id="${e.id}" style="--c:${okColor(c.color)}"><div class="time">${e.start ? `<b>${fmtTime(e.start)}</b>${e.end ? fmtTime(e.end) : ''}` : '<b>Any time</b>'}</div><div style="min-width:0"><h4>${esc(e.title || 'Untitled')}</h4>${sm ? `<p>${esc(sm)}</p>` : ''}${isRep(e) ? `<p class="rep-line">${REP_IC}${esc(repeatText(e._occ ? db.events.find(x => x.id === e._occ) || e : e))}</p>` : ''}</div><span class="tag">${icon(e.format)}${e._friend ? esc(firstName(e._friend)) + ' · ' : ''}${esc(c.name)}</span></button>`;
   }
   return h + renderNews(s) + '</div>';
 }
@@ -634,6 +769,7 @@ function renderCalendars() {
       <div class="field"><span>Color</span><div class="swatches">${SWATCHES.map(s => `<button class="sw" style="--c:${s}" data-act="cal-color" data-id="${c.id}" data-color="${s}" aria-pressed="${s === c.color}" aria-label="Color ${s}"></button>`).join('')}</div></div>
     </div><div class="grp" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="muted">${n} event${n === 1 ? '' : 's'}</span>
       <label class="btn">Import from Excel<input type="file" data-imp-cal="${c.id}" accept="${IMPORT_ACCEPT}" hidden></label>
+      <span class="share-ctl" title="Who can see this calendar">${seg('share', c.sharing === 'friends' ? 'friends' : 'private', [['private', 'Private'], ['friends', 'Friends']]).replaceAll('data-act="share"', `data-act="share" data-id="${c.id}"`)}</span>
       ${confirmCal === c.id ? `<button class="btn" data-act="cal-del-cancel">Keep</button><button class="btn danger solid" data-act="cal-del-confirm" data-id="${c.id}">Delete calendar${n ? ` and ${n} event${n > 1 ? 's' : ''}` : ''}</button>` : `<button class="btn danger" data-act="cal-del" data-id="${c.id}">Delete</button>`}
     </div></div>`;
   }
@@ -804,9 +940,26 @@ function renderBuilder() {
     <div class="bf-prev-wrap"><span class="eyebrow" style="margin-bottom:8px">Live preview</span><div id="bf-prev" inert>${builderPreview(cf)}</div></div></div></div>`;
 }
 
+function renderFriendDoc(o) {
+  const c = calOf(o), f = o.format, cf = friendFormat(o, f), master = o._occ ? friendEvents().find(x => x.id === o._occ) : o;
+  const skin = cf ? `custom ${STYLES[cf.style]?.skin || ''}` : `fmt-${FORMATS[f] ? f : 'notes'}`;
+  const back = { year: 'Year', week: 'Week', day: 'Day', friends: 'Friends' }[view.back.mode] || 'Week';
+  const when = [longDate(parse(o.date)), o.start ? fmtTime(o.start) + (o.end ? ' – ' + fmtTime(o.end) : '') : ''].filter(Boolean).join(' · ');
+  let body;
+  if (cf) body = bodyCustom(o, cf);
+  else if (BODIES[f]) body = BODIES[f](o);
+  else body = bodyNotes({ ...o, data: { notes: o.data?.notes || '' } });
+  return `<article class="doc ${skin} ro-doc" style="--c:${okColor(c?.color || '#4263eb')}${cf ? `;--d-accent:${okColor(cf.color)}` : ''}">
+    <div class="doc-top"><button class="back" data-act="back">‹ ${back}</button><span class="eyebrow">${icon(f)}${esc(personName(o._friend))}’s ${esc(c?.name || 'calendar')}</span></div>
+    <h1 class="ttl ro">${esc(o.title || 'Untitled')}</h1>
+    <p class="ro-when">${esc(when)}${master?.repeat ? ` · ${esc(repeatText(master))}` : ''}</p>
+    <fieldset class="ro" disabled>${body}</fieldset>
+    <p class="ro-note">You’re viewing ${esc(firstName(o._friend))}’s calendar. Only they can change it.</p></article>`;
+}
 function renderDoc() {
   const o = curObj();
   if (!o) { view = { mode: 'week', date: view.date }; return renderWeek(); }
+  if (view.kind === 'friend') return renderFriendDoc(o);
   const k = view.kind, cal = k === 'event' ? calOf(o) : null, f = o.format;
   const backLabel = k === 'event' ? { year: 'Year', week: 'Week', day: 'Day', library: 'Library', calendars: 'Calendars' }[view.back.mode] : 'Library';
   const tag = [esc(fmtName(f)), cal && esc(cal.name), k === 'saved' && 'Template', k === 'preview' && 'Preview'].filter(Boolean).join(' · ');
@@ -999,6 +1152,40 @@ window.addEventListener('drop', ev => {
   startImport(f, target?.dataset.dropCal || (view.mode === 'doc' && view.kind === 'event' ? curObj()?.calId : ''));
 });
 
+/* ---------- friends page ---------- */
+let confirmUnfriend = null, emailSent = false;
+const inviteUrl = () => social.me?.invite_code ? `${location.origin}/?invite=${social.me.invite_code}` : '';
+const MONTH_OPTS = cur => `<option value="">Month</option>` + MONTHS.map((m, i) => `<option value="${i + 1}"${cur === i + 1 ? ' selected' : ''}>${m}</option>`).join('');
+const DAY_OPTS = cur => `<option value="">Day</option>` + Array.from({ length: 31 }, (_, i) => `<option${cur === i + 1 ? ' selected' : ''}>${i + 1}</option>`).join('');
+const bdayText = p => p?.birthday_month && p?.birthday_day ? `Birthday ${MONTHS[p.birthday_month - 1]} ${p.birthday_day}` : '';
+function renderFriends() {
+  let h = `<div class="page"><h1>Friends</h1>`;
+  if (!user) return h + `<p class="lede">Friends can see the calendars you choose to share, and you can see theirs. Sign in first so they can find you.</p><section class="panel">${authForm()}</section></div>`;
+  const me = social.me, mine = user.id;
+  const incoming = social.requests.filter(r => r.status === 'pending' && r.to_id === mine), outgoing = social.requests.filter(r => r.status === 'pending' && r.from_id === mine), fids = friendIds();
+  h += `<p class="lede">Friends see your name, your birthday and the calendars you share, view only. You see theirs the same way.</p><div class="stack">`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">You</h2>${me ? `<div class="m-row" style="align-items:end">
+      <label class="field" style="flex:2 1 200px"><span>Your name</span><input id="pf-name" value="${esc(me.display_name)}" placeholder="What friends call you" autocomplete="name"></label>
+      <div class="field" style="flex:1 1 220px"><span>Birthday</span><div class="m-row"><select id="pf-month" aria-label="Birthday month">${MONTH_OPTS(me.birthday_month)}</select><select id="pf-day" aria-label="Birthday day">${DAY_OPTS(me.birthday_day)}</select></div></div></div>` : '<p class="muted" style="margin:0">Loading your profile…</p>'}</section>`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">Add a friend</h2>
+    <p class="muted" style="margin:0">Send your invite link. When they open it and sign in, you’ll get their request here.</p>
+    ${inviteUrl() ? `<div class="inrow"><input id="inv-link" value="${esc(inviteUrl())}" readonly aria-label="Your invite link"><button class="btn primary" data-act="inv-share">${navigator.share ? 'Share' : 'Copy'}</button></div>` : ''}
+    <form class="inrow" data-form="add-friend"><input type="email" id="af-email" placeholder="Or their email address" aria-label="Friend’s email" required><button class="btn">Send request</button></form></section>`;
+  if (incoming.length) h += `<section class="panel stack"><h2 class="sec" style="margin:0">Requests for you</h2>${incoming.map(r => `<div class="frow"><b>${esc(personName(r.from_id))}</b><span class="m-row"><button class="btn primary" data-act="fr-accept" data-id="${r.from_id}">Accept</button><button class="btn" data-act="fr-remove" data-id="${r.from_id}">Decline</button></span></div>`).join('')}</section>`;
+  if (outgoing.length) h += `<section class="panel stack"><h2 class="sec" style="margin:0">Waiting for them to accept</h2>${outgoing.map(r => `<div class="frow"><b>${esc(personName(r.to_id))}</b><button class="btn" data-act="fr-remove" data-id="${r.to_id}">Cancel</button></div>`).join('')}</section>`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">Your friends</h2>`;
+  if (!fids.length) h += `<p class="muted" style="margin:0">No friends yet. Send someone your invite link.</p>`;
+  for (const id of fids) {
+    const p = social.people[id], cals = friendCals().filter(c => c.owner === id);
+    h += `<div class="friend"><div class="frow"><div><b>${esc(personName(id))}</b>${bdayText(p) ? `<div class="muted">${esc(bdayText(p))}</div>` : ''}</div>${confirmUnfriend === id ? `<span class="m-row"><button class="btn" data-act="fr-keep">Keep</button><button class="btn danger solid" data-act="fr-remove" data-id="${id}">Remove friend</button></span>` : `<button class="btn ghost" data-act="fr-unfriend" data-id="${id}">Remove</button>`}</div>
+      ${cals.length ? `<div class="pick">${cals.map(c => `<button data-act="fcal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name)}</button>`).join('')}</div><small class="muted">Tap a calendar to show or hide it on yours.</small>` : `<small class="muted">${esc(firstName(id))} hasn’t shared any calendars yet.</small>`}</div>`;
+  }
+  h += `</section>`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">What you share</h2><p class="muted" style="margin:0">Friends can see everything on a shared calendar, view only. Nothing is shared until you choose it here.</p>
+    ${db.calendars.length ? db.calendars.map(c => setRow(`<span class="dot" style="--c:${okColor(c.color)};display:inline-block;margin-right:8px"></span>${esc(c.name || 'Untitled')}`, '', seg('share', c.sharing === 'friends' ? 'friends' : 'private', [['private', 'Private'], ['friends', 'Friends']]).replaceAll('data-act="share"', `data-act="share" data-id="${c.id}"`))).join('') : '<p class="muted" style="margin:0">Make a calendar first.</p>'}</section>`;
+  return h + '</div></div>';
+}
+
 /* ---------- sign in ---------- */
 let auth = { email: '', sent: false, busy: false, err: '' };
 function authForm() {
@@ -1027,7 +1214,7 @@ function renderWelcome() {
     <div class="brand big">${BRAND}Almanac</div>
     <h1>Your year, in one place.</h1>
     <p class="lede">Plan your calendars, track workouts, and later share the calendars you choose with friends. Sign in with your email, no password needed, and it syncs between your phone and computer.</p>
-    ${authForm()}
+    ${pendingInvite() ? '<p class="invite-note">A friend invited you. Sign in and you’ll be connected.</p>' : ''}${authForm()}
     <button class="linkish" data-act="guest">Try it on this device without an account</button>
   </div></div>`;
 }
@@ -1076,7 +1263,7 @@ async function importFile(file) {
 function render() {
   renderSub();
   document.body.classList.toggle('welcoming', view.mode === 'welcome');
-  $('main').innerHTML = ({ year: renderYear, week: renderWeek, day: renderDay, doc: renderDoc, library: renderLibrary, calendars: renderCalendars, builder: renderBuilder, settings: renderSettings, welcome: renderWelcome }[view.mode] || renderWeek)();
+  $('main').innerHTML = ({ year: renderYear, week: renderWeek, day: renderDay, doc: renderDoc, library: renderLibrary, calendars: renderCalendars, builder: renderBuilder, settings: renderSettings, welcome: renderWelcome, friends: renderFriends }[view.mode] || renderWeek)();
   renderModal();
   autosize();
 }
@@ -1097,7 +1284,7 @@ function go(mode, date) { leaveDoc(); modal = null; view = { mode, date: date ||
 function openDoc(kind, id) {
   const back = view.mode === 'doc' ? view.back : { mode: ['builder', 'settings', 'welcome'].includes(view.mode) ? 'week' : view.mode };
   leaveDoc(); modal = null;
-  const date = kind === 'event' ? db.events.find(e => e.id === id)?.date : view.date;
+  const date = kind === 'event' ? db.events.find(e => e.id === id)?.date : kind === 'friend' ? (String(id).split('@')[1] || friendEvents().find(e => e.id === id)?.date) : view.date;
   view = { mode: 'doc', kind, id, date: date || view.date, back };
   render(); window.scrollTo(0, 0);
 }
@@ -1129,14 +1316,27 @@ document.addEventListener('click', ev => {
   switch (a) {
     case 'mode': go(ds.mode, view.date); break;
     case 'bills-toggle': billsOpen = !billsOpen; softRender(); break;
+    case 'fcal-toggle': { const cur = db.prefs.friendCals || {}; db.prefs.friendCals = { ...cur, [ds.id]: cur[ds.id] === false }; fcCache = null; save(); render(); break; }
+    case 'bday-toggle': db.prefs.birthdays = !birthdaysOn(); save(); render(); break;
+    case 'share': { const c = db.calendars.find(x => x.id === ds.id); if (!c) break; c.sharing = ds.v === 'friends' ? 'friends' : 'private'; save(); render(); toast(c.sharing === 'friends' ? `Friends can now see ${c.name || 'this calendar'}` : `${c.name || 'This calendar'} is private`); break; }
+    case 'fr-accept': friendAction(() => supa.rpc('accept_friend', { p_from: ds.id })); break;
+    case 'fr-unfriend': confirmUnfriend = ds.id; render(); break;
+    case 'fr-keep': confirmUnfriend = null; render(); break;
+    case 'fr-remove': confirmUnfriend = null; friendAction(() => supa.from('friend_requests').delete().or(`and(from_id.eq.${user.id},to_id.eq.${ds.id}),and(from_id.eq.${ds.id},to_id.eq.${user.id})`)); break;
+    case 'inv-share': {
+      const url = inviteUrl(); if (!url) break;
+      if (navigator.share) navigator.share({ title: 'Almanac', text: `Add me as a friend on Almanac`, url }).catch(() => {});
+      else navigator.clipboard?.writeText(url).then(() => toast('Invite link copied'), () => { $('inv-link')?.select(); toast('Copy the link above'); });
+      break;
+    }
     case 'nav': { const d = parse(view.date), n = +ds.dir; if (view.mode === 'year') d.setFullYear(d.getFullYear() + n); if (view.mode === 'week') d.setDate(d.getDate() + 7 * n); if (view.mode === 'day') d.setDate(d.getDate() + n); go(view.mode, iso(d)); break; }
     case 'today': go(view.mode, todayS()); break;
     case 'day': go('day', ds.date); break;
     case 'week': go('week', ds.date); break;
-    case 'open': { const id = ds.id.includes('@') ? materialize(ds.id) : ds.id; if (id) openDoc('event', id); break; }
+    case 'open': { if (ds.id.startsWith('f:')) { openDoc('friend', ds.id); break; } const id = ds.id.includes('@') ? materialize(ds.id) : ds.id; if (id) openDoc('event', id); break; }
     case 'open-saved': openDoc('saved', ds.id); break;
     case 'preview': preview = sample(ds.fmt); openDoc('preview', 'preview'); break;
-    case 'back': go(view.kind === 'event' ? view.back.mode : 'library', o?.date || view.date); break;
+    case 'back': go(view.kind === 'event' || view.kind === 'friend' ? view.back.mode : 'library', o?.date || view.date); break;
     case 'new': openNew({ calId: ds.cal, date: ds.date, format: ds.fmt, savedId: ds.saved }); break;
     case 'cal-toggle': { const c = db.calendars.find(x => x.id === ds.id); c.hidden = !c.hidden; save(); render(); break; }
     case 'lib-tab': libTab = ds.tab; confirmSaved = null; render(); break;
@@ -1294,6 +1494,8 @@ document.addEventListener('click', ev => {
 /* ---------- typing ---------- */
 document.addEventListener('input', ev => {
   const t = ev.target, ds = t.dataset;
+  if (t.id === 'pf-name') { saveProfileSoon({ display_name: t.value }); return; }
+  if (t.id === 'pf-month' || t.id === 'pf-day') { saveProfileSoon({ [t.id === 'pf-month' ? 'birthday_month' : 'birthday_day']: t.value ? +t.value : null }); return; }
   if (modal?.type === 'import') {
     if (t.id === 'im-sheet') { modal.sheet = +t.value; prepImport(); renderModal(); return; }
     if (ds.im) { if (t.value === '') delete modal.map[ds.im]; else { for (const k in modal.map) if (modal.map[k] === +t.value) delete modal.map[k]; modal.map[ds.im] = +t.value; } renderModal(); return; }
@@ -1370,6 +1572,7 @@ document.addEventListener('submit', ev => {
   const f = ev.target.closest('form[data-form]'); if (!f) return;
   ev.preventDefault();
   if (f.dataset.form === 'send') { const email = $('au-email').value.trim(); if (email) sendLink(email); }
+  if (f.dataset.form === 'add-friend') { const e = $('af-email').value.trim(); if (e) addFriendByEmail(e).then(ok => { if (ok && $('af-email')) $('af-email').value = ''; }); }
   if (f.dataset.form === 'verify') { const code = $('au-code').value.trim(); if (code) verifyCode(code); }
 });
 document.addEventListener('change', ev => {
