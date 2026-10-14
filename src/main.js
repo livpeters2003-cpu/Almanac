@@ -497,17 +497,17 @@ function renderDay() {
   return h + renderNews(s) + '</div>';
 }
 
-/* ---------- daily news brief (written each morning into news_briefs) ---------- */
+/* ---------- news (live top stories, loaded every time the app opens) ---------- */
 let news = {}, newsLoading = false, newsCheckedAt = 0;
 const safeUrl = u => /^https:\/\/[^\s"'<>]+$/i.test(String(u || '')) ? u : null;
-const newsOn = () => !!user && db.prefs.news !== false;
-// Loads the newest briefs every time the app opens or comes back to the front.
+const newsOn = () => db.prefs.news !== false;
 async function loadNews(force) {
   if (!newsOn() || newsLoading) return;
   newsLoading = true; if (force && view.mode === 'day') softRender();
   try {
-    const { data, error } = await supa.from('news_briefs').select('date, items, generated_at').order('date', { ascending: false }).limit(60);
-    if (!error) { const m = {}; for (const v of data || []) if (v && typeof v.date === 'string') m[v.date] = v; news = m; newsCheckedAt = Date.now(); }
+    const res = await fetch('/api/news' + (force ? '?t=' + Date.now() : ''), { cache: force ? 'no-store' : 'default' });
+    const v = res.ok ? await res.json() : null;
+    if (v && Array.isArray(v.items) && v.items.length) { news = { ...news, [todayS()]: { date: todayS(), items: v.items, generated_at: v.generated_at } }; newsCheckedAt = Date.now(); }
   } catch (e) {}
   newsLoading = false;
   if (view.mode === 'day') softRender();
@@ -515,13 +515,13 @@ async function loadNews(force) {
 function renderNews(s) {
   if (!newsOn()) return '';
   const n = news[s], t = todayS();
-  const when = n?.generated_at ? `Written ${esc(new Date(n.generated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}` : '';
-  const head = `<header><div><span class="eyebrow">Daily news brief</span><h3>${s === t ? 'Today’s news' : 'News for ' + shortDate(parse(s))}</h3></div><div class="news-act"><span class="muted">${newsLoading ? 'Checking for news…' : when}</span><button class="btn" data-act="news-refresh"${newsLoading ? ' disabled' : ''}>Refresh</button></div></header>`;
+  const when = n?.generated_at ? `Updated ${esc(new Date(n.generated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}` : '';
+  const head = `<header><div><span class="eyebrow">News</span><h3>${s === t ? 'Today’s news' : 'News for ' + shortDate(parse(s))}</h3></div><div class="news-act"><span class="muted">${newsLoading ? 'Checking for news…' : when}</span><button class="btn" data-act="news-refresh"${newsLoading ? ' disabled' : ''}>Refresh</button></div></header>`;
   if (!n || !Array.isArray(n.items) || !n.items.length) {
-    const msg = s > t ? 'This day’s brief will be written that morning.' : s === t ? 'Today’s brief hasn’t arrived yet. It’s written each morning; tap Refresh to check again.' : 'No brief was saved for this day.';
+    const msg = s > t ? 'News for this day shows up that day.' : s === t ? (newsLoading ? 'Loading the latest news…' : 'Couldn’t load the news just now. Tap Refresh to try again.') : 'News is only kept for today.';
     return `<section class="news">${head}<p class="muted" style="margin:0">${msg}</p></section>`;
   }
-  return `<section class="news">${head}<div class="news-grid">` + n.items.map(it => `<article class="news-i"><span class="topic">${esc(it.topic)}</span><h4>${esc(it.headline)}</h4><p>${esc(it.summary)}</p>${Array.isArray(it.sources) && it.sources.length ? `<div class="src">${it.sources.map(x => safeUrl(x.url) ? `<a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name || 'Source')}</a>` : `<span>${esc(x.name)}</span>`).join('')}</div>` : ''}</article>`).join('') + `</div><p class="muted news-foot">Facts only, attributed to their sources. Written automatically by Claude from news reports, so check the linked articles for full context.</p></section>`;
+  return `<section class="news">${head}<div class="news-grid">` + n.items.map(it => `<article class="news-i"><span class="topic">${esc(it.topic)}</span><h4>${esc(it.headline)}</h4><p>${esc(it.summary)}</p>${Array.isArray(it.sources) && it.sources.length ? `<div class="src">${it.sources.map(x => safeUrl(x.url) ? `<a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name || 'Source')}</a>` : `<span>${esc(x.name)}</span>`).join('')}</div>` : ''}</article>`).join('') + `</div><p class="muted news-foot">The latest top stories from the outlets linked. Updated every time you open Almanac.</p></section>`;
 }
 
 /* ---------- library ---------- */
@@ -878,7 +878,7 @@ function renderSettings() {
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Appearance</h2>${setRow('Theme', 'Auto follows your phone or computer.', seg('theme', p.theme || 'auto', [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Holidays</h2>${setRow('Show holidays', 'A built-in calendar you can hide from the legend too.', seg('hol-on', holidaysOn() ? 'on' : 'off', [['on', 'Show'], ['off', 'Hide']]))}
     <div class="field"><span>Countries</span><div class="pick">${Object.entries(COUNTRIES).map(([c, n]) => `<button data-act="hol-cc" data-v="${c}" aria-pressed="${cc.includes(c)}">${esc(n)}</button>`).join('')}</div></div></section>`;
-  h += `<section class="panel stack"><h2 class="sec" style="margin:0">Daily news brief</h2>${setRow('Show the brief on the Day view', 'A few short, sourced stories written each morning. The newest one loads every time you open the app.', seg('news-on', p.news !== false ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]))}</section>`;
+  h += `<section class="panel stack"><h2 class="sec" style="margin:0">News</h2>${setRow('Show news on the Day view', 'The latest top stories from NPR, BBC News and The Guardian, updated every time you open the app.', seg('news-on', p.news !== false ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Workouts</h2>${setRow('Weight unit', 'Used on Workout pages.', seg('unit', db.unit, [['lb', 'lb'], ['kg', 'kg']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Bring over your Year Planner</h2><p class="muted" style="margin:0">In the old Year Planner, choose <b>Export my data</b> to download a file, then choose it here. Calendars, events, templates, formats and exercises are added; nothing here is replaced.</p><label class="btn" style="align-self:flex-start">Choose file<input type="file" id="imp-file" accept="application/json,.json" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Put Almanac on your phone</h2>${standalone() ? '<p class="muted" style="margin:0">You’re using the installed app.</p>' : `${installEvt ? '<button class="btn primary" data-act="install" style="align-self:flex-start">Install Almanac</button>' : ''}<p class="muted" style="margin:0"><b>iPhone:</b> open this site in Safari, tap the Share button, then <b>Add to Home Screen</b>.<br><b>Android:</b> open the browser menu and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>`}</section>`;
@@ -1053,7 +1053,7 @@ document.addEventListener('click', ev => {
     case 'hol-on': db.prefs.holidays = { ...db.prefs.holidays, on: ds.v === 'on' }; save(); render(); break;
     case 'hol-cc': { const cc = new Set(db.prefs.holidays.countries?.length ? db.prefs.holidays.countries : ['US']); cc.has(ds.v) ? cc.size > 1 && cc.delete(ds.v) : cc.add(ds.v); db.prefs.holidays = { ...db.prefs.holidays, countries: [...cc] }; save(); render(); break; }
     case 'news-on': db.prefs.news = ds.v === 'on'; save(); render(); if (db.prefs.news) loadNews(); break;
-    case 'guest': guestMode = true; try { localStorage.setItem('almanac-guest', '1'); } catch (e) {} setStatus('local'); go('week', todayS()); break;
+    case 'guest': loadNews(); guestMode = true; try { localStorage.setItem('almanac-guest', '1'); } catch (e) {} setStatus('local'); go('week', todayS()); break;
     case 'au-back': auth = { email: auth.email, sent: false, busy: false, err: '' }; render(); break;
     case 'signout': supa.auth.signOut().finally(() => { endSession(); auth = { email: '', sent: false, busy: false, err: '' }; setStatus(''); go('welcome', todayS()); }); break;
     case 'install': installEvt?.prompt(); installEvt = null; break;
@@ -1156,10 +1156,14 @@ document.addEventListener('input', ev => {
 });
 
 /* fields that change the page's layout or computed bits redraw once the value is committed */
+// Date and time pickers (the iPhone wheels especially) fire change on every turn of the wheel,
+// so redrawing then would close the picker; those wait until the field loses focus.
 document.addEventListener('change', ev => {
-  const f = ev.target.dataset.f;
-  if (view.mode !== 'doc' || !(['format', 'calId', 'date', 'start', 'end'].includes(f) || ev.target.dataset.rep)) return;
-  const y = scrollY; render(); scrollTo(0, y);
+  const t = ev.target, f = t.dataset.f;
+  if (view.mode !== 'doc' || f === 'start' || f === 'end' || !(['format', 'calId', 'date'].includes(f) || t.dataset.rep)) return;
+  const redraw = () => { if (view.mode !== 'doc') return; const y = scrollY; render(); scrollTo(0, y); };
+  if (t.type === 'date' && document.activeElement === t) { if (!t.dataset.waiting) { t.dataset.waiting = '1'; t.addEventListener('blur', redraw, { once: true }); } return; }
+  redraw();
 });
 
 document.addEventListener('submit', ev => {
@@ -1181,7 +1185,7 @@ applyTheme();
 supa.auth.getSession().then(({ data }) => {
   authReady = true;
   if (data.session?.user) { startSession(data.session.user); return; }
-  if (guestMode || hasData(db)) { guestMode = true; setStatus('local'); }
+  if (guestMode || hasData(db)) { guestMode = true; setStatus('local'); loadNews(); }
   else view = { mode: 'welcome', date: todayS() };
   render();
 });
