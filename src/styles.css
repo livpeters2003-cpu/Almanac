@@ -525,3 +525,22 @@ fieldset.ro input::placeholder, fieldset.ro textarea::placeholder { color: trans
 .invite-note { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); border-radius: 10px; padding: 10px 12px; color: var(--ink) !important; font-weight: 500; }
 #inv-link { font: 13px var(--f-mono); }
 .panel .inrow > input, .panel .m-row > select { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+
+/* cycle tracking */
+.hol.cyc.pred { background: transparent; border: 1px dashed var(--c); }
+.dots i.pred { background: transparent; box-shadow: inset 0 0 0 1.5px var(--c); }
+.cyc { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid #e03131; border-radius: 14px; padding: 14px 16px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 12px; }
+.cyc-h h3 { margin: 2px 0 4px; font: 700 19px/1.2 var(--f-display); }
+.cyc-h p { margin: 0; color: var(--muted); font-size: 14px; }
+.cyc-log { display: flex; flex-direction: column; gap: 10px; }
+.cyc-pick button { padding: 5px 10px; font-size: 13px; --c: #e03131; }
+.cyc-sug { background: color-mix(in srgb, #e03131 7%, var(--bg)); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.cyc-sug b { font: 700 17px var(--f-display); }
+.cyc-sug p { margin: 0; font-size: 14px; }
+.cyc-sug small { color: var(--muted); font-size: 12px; }
+.cyc-foot { margin: 0; font-size: 13px; }
+.w-cyc { margin: 14px 0 4px; }
+.w-cyc .cyc-sug { background: color-mix(in srgb, #e03131 14%, var(--d-field, var(--bg))); color: var(--d-ink, var(--ink)); }
+.w-cyc .cyc-sug small, .w-cyc .eyebrow { color: var(--d-muted, var(--muted)); }
+.hol.bday::before { content: none; } .hol.cyc::before { content: "● "; }
+.cyc-open { align-self: flex-start; text-align: left; white-space: normal; }

@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 import { holidaysFor, COUNTRIES } from './holidays.js';
 import { readTable, prepare, planWorkouts, planEvents, FIELDS, SAMPLE_CSV } from './importer.js';
+import * as Cycle from './cycle.js';
 
 /* ---------- constants ---------- */
 const WD = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
@@ -305,7 +306,7 @@ function listen() {
   for (const table of ['friend_requests', 'profiles']) channel.on('postgres_changes', { event: '*', schema: 'public', table }, loadSocialSoon);
   channel.subscribe();
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) { pullSoon(); loadSocialSoon(); } loadNews(); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) { pullSoon(); loadSocialSoon(); pullCycle(); } loadNews(); } });
 window.addEventListener('online', () => { if (user) { pullSoon(); flush(); } });
 
 function startSession(u) {
@@ -320,12 +321,17 @@ function startSession(u) {
   persistLocal(); applyTheme(); setStatus('checking');
   if (view.mode === 'welcome') view = { mode: 'week', date: todayS() };
   restoreSocial();
-  render(); pull(); listen(); loadNews(); loadSocial().then(useInvite);
+  { const mineC = loadCycleLocal(u.id), guestC = loadCycleLocal(GUEST);
+    cyc = (!mineC.settings.on && !Object.keys(mineC.logs).length && (guestC.settings.on || Object.keys(guestC.logs).length)) ? guestC : mineC;
+    if (cyc === guestC) { try { localStorage.removeItem(cycleKey(GUEST)); } catch (e) {} }
+    cycStats = null; cycDirty = new Set(); cycProfileDirty = false; }
+  render(); pull(); listen(); loadNews(); loadSocial().then(useInvite); pullCycle();
 }
 function endSession() {
   if (channel) { supa.removeChannel(channel); channel = null; }
   user = null; ready = false; owner = GUEST; db = loadLocal(GUEST);
   synced = { settings: null, calendars: {}, events: {}, saved: {} };
+  cyc = loadCycleLocal(GUEST); cycStats = null; cycDirty = new Set(); cycProfileDirty = false;
   news = {}; social = { me: null, requests: [], people: {}, cals: [], events: [] }; fcCache = feCache = null; applyTheme();
 }
 
@@ -531,9 +537,112 @@ function specialDays() {
   const h = holidayMap(), b = birthdayMap(), m = {};
   for (const k in h) m[k] = h[k].map(x => ({ ...x, kind: 'hol' }));
   for (const k in b) (m[k] || (m[k] = [])).push(...b[k].map(x => ({ ...x, kind: 'bday' })));
+  const c = cycleDays();
+  for (const k in c) (m[k] || (m[k] = [])).unshift(...c[k]);
   return m;
 }
-const specialChip = x => x.kind === 'bday' ? bdayChip(x) : holChip(x);
+const specialChip = x => x.kind === 'bday' ? bdayChip(x) : x.kind === 'cycle' ? cycleChip(x) : holChip(x);
+
+/* ---------- cycle tracking (opt-in, private: its own tables that only you can read) ---------- */
+const CYCLE_BLANK = () => ({ settings: { on: false }, logs: {} });
+const cycleKey = who => `almanac-cycle:${who}`;
+function loadCycleLocal(who) { try { const c = JSON.parse(localStorage.getItem(cycleKey(who))); if (c && typeof c.logs === 'object') return { settings: { on: false, ...c.settings }, logs: c.logs || {} }; } catch (e) {} return CYCLE_BLANK(); }
+let cyc = loadCycleLocal(GUEST), cycDirty = new Set(), cycProfileDirty = false, cycTimer = null, cycStats = null;
+const cycleOn = () => !!cyc.settings.on && !!cyc.settings.lastStart;
+function saveCycle(dates = [], profile = false) {
+  cycStats = null;
+  try { localStorage.setItem(cycleKey(owner), JSON.stringify(cyc)); } catch (e) {}
+  dates.forEach(d => cycDirty.add(d)); if (profile) cycProfileDirty = true;
+  if (user) { clearTimeout(cycTimer); cycTimer = setTimeout(flushCycle, 800); }
+}
+async function flushCycle() {
+  if (!user) return;
+  try {
+    if (cycProfileDirty) { const { error } = await supa.from('cycle_profile').upsert({ user_id: user.id, settings: cyc.settings, updated_at: new Date().toISOString() }); if (error) throw error; cycProfileDirty = false; }
+    const dates = [...cycDirty], up = dates.filter(d => cyc.logs[d]), del = dates.filter(d => !cyc.logs[d]);
+    if (up.length) { const { error } = await supa.from('cycle_logs').upsert(up.map(d => ({ user_id: user.id, date: d, data: cyc.logs[d], updated_at: new Date().toISOString() }))); if (error) throw error; }
+    if (del.length) { const { error } = await supa.from('cycle_logs').delete().eq('user_id', user.id).in('date', del); if (error) throw error; }
+    dates.forEach(d => cycDirty.delete(d));
+  } catch (e) { clearTimeout(cycTimer); cycTimer = setTimeout(flushCycle, 8000); }
+}
+async function pullCycle() {
+  if (!user) return;
+  const me = user.id;
+  try {
+    const [pr, lg] = await Promise.all([supa.from('cycle_profile').select('settings').eq('user_id', me).maybeSingle(), supa.from('cycle_logs').select('date, data').eq('user_id', me).order('date')]);
+    if (pr.error || lg.error || user?.id !== me) return;
+    const logs = {}; for (const r of lg.data || []) logs[r.date] = r.data;
+    for (const d of cycDirty) { if (cyc.logs[d]) logs[d] = cyc.logs[d]; else delete logs[d]; }   // edits not uploaded yet win
+    const settings = cycProfileDirty || !pr.data ? cyc.settings : { on: false, ...pr.data.settings };
+    if (!pr.data && (cyc.settings.on || Object.keys(cyc.logs).length)) { cycProfileDirty = true; Object.keys(cyc.logs).forEach(d => cycDirty.add(d)); Object.assign(logs, cyc.logs); }
+    cyc = { settings, logs }; saveCycle();
+    if (cycDirty.size || cycProfileDirty) flushCycle();
+    softRender();
+  } catch (e) {}
+}
+function cycleStats() { return cycStats || (cycStats = Cycle.stats(cyc.logs, cyc.settings)); }
+const cycleInfo = d => cycleOn() ? Cycle.dayInfo(d, cyc.logs, cyc.settings, cycleStats()) : null;
+const CYCLE_COLOR = '#e03131';
+function cycleDays() {
+  if (!cycleOn()) return {};
+  const y = parse(view.date).getFullYear(), from = iso(new Date(y - 1, 11, 1)), to = iso(new Date(y + 1, 0, 31)), m = {};
+  for (const [d, v] of Object.entries(cyc.logs)) if (v?.period && d >= from && d <= to) m[d] = [{ kind: 'cycle', name: v.period === 'spotting' ? 'Spotting' : 'Period' }];
+  for (const d of Cycle.predictedPeriods(cyc.logs, cyc.settings, from, to, cycleStats())) if (d >= todayS()) m[d] = [{ kind: 'cycle', name: 'Period (predicted)', predicted: true }];
+  return m;
+}
+const cycleChip = x => `<span class="hol cyc${x.predicted ? ' pred' : ''}" style="--c:${CYCLE_COLOR}" title="${esc(x.name)}">${esc(x.name)}</span>`;
+function setLog(d, patch) {
+  const cur = { ...(cyc.logs[d] || {}), ...patch };
+  for (const k of Object.keys(cur)) if (cur[k] === '' || cur[k] === 0 || (Array.isArray(cur[k]) && !cur[k].length)) delete cur[k];
+  if (Object.keys(cur).length) cyc.logs[d] = cur; else delete cyc.logs[d];
+  saveCycle([d]);
+}
+const pick1 = (act, cur, opts, extra = '') => `<div class="pick cyc-pick">${opts.map(([v, n]) => `<button data-act="${act}" data-v="${esc(v)}" aria-pressed="${cur === v}"${extra}>${n}</button>`).join('')}</div>`;
+function suggestionBox(info, d) {
+  const sug = Cycle.suggestion(info, cyc.logs[d] || {}, Cycle.energyByPhase(cyc.logs, cyc.settings, cycleStats()));
+  if (!sug) return '';
+  return `<div class="cyc-sug"><span class="eyebrow">Suggested workout</span><b>${esc(sug.title)}</b><p>${esc(sug.text)}</p><small>Based on your ${esc(Cycle.PHASES[info.phase].name.toLowerCase())}${sug.why.length ? ' and ' + esc(sug.why.join(', ')) : ''}. General guidance, not medical advice.</small></div>`;
+}
+function cycleCard(d) {
+  const info = cycleInfo(d); if (!info) return '';
+  const log = cyc.logs[d] || {}, t = todayS(), st = cycleStats(), future = d > t;
+  const until = Cycle.daysBetween(t, info.nextStart);
+  const head = `<div class="cyc-h"><div><span class="eyebrow">Your cycle · only you can see this</span><h3>Day ${info.day} · ${esc(Cycle.PHASES[info.phase].name)}${info.predicted ? ' (predicted)' : ''}</h3><p>${esc(Cycle.PHASES[info.phase].blurb)} ${d <= t && until >= 0 ? `Next period ${until === 0 ? 'likely today' : until === 1 ? 'likely tomorrow' : `in about ${until} days (${shortDate(parse(info.nextStart))})`}.` : ''}</p></div></div>`;
+  let h = `<section class="cyc">${head}`;
+  if (!future && !cycOpen) {
+    const bits = [log.period && Cycle.FLOW[log.period] + ' flow', log.energy && 'energy ' + log.energy, log.mood, ...(log.symptoms || []), log.sleep && Cycle.SLEEP[log.sleep] + ' sleep'].filter(Boolean);
+    h += `<button class="btn cyc-open" data-act="cy-open">${bits.length ? `Logged: ${esc(bits.join(', '))} · Edit` : 'Log your period and how you feel'}</button>`;
+  }
+  if (!future && cycOpen) {
+    h += `<div class="cyc-log"><div class="field"><span>Period</span>${pick1('cy-flow', log.period || '', [['', 'None'], ...Object.entries(Cycle.FLOW)])}</div>
+      <div class="field"><span>Energy</span>${pick1('cy-energy', String(log.energy || ''), [['1', '1 · Drained'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5 · Great']])}</div>
+      <div class="field"><span>Mood</span>${pick1('cy-mood', log.mood || '', Cycle.MOODS.map(m => [m, m]))}</div>
+      <div class="field"><span>Symptoms</span><div class="pick cyc-pick">${Cycle.SYMPTOMS.map(x => `<button data-act="cy-sym" data-v="${esc(x)}" aria-pressed="${(log.symptoms || []).includes(x)}">${esc(x)}</button>`).join('')}</div></div>
+      <div class="field"><span>Sleep</span>${pick1('cy-sleep', log.sleep || '', Object.entries(Cycle.SLEEP))}</div><div><button class="btn" data-act="cy-open">Done</button></div></div>`;
+  }
+  h += suggestionBox(info, d);
+  if (st.cyclesLogged < 2) h += `<p class="muted cyc-foot">Predictions get more accurate after you log two or three periods.</p>`;
+  return h + '</section>';
+}
+function workoutCycleBanner(o) {
+  if (view.kind !== 'event' || o.date < todayS() || !cycleOn()) return '';
+  const info = cycleInfo(o.date); if (!info) return '';
+  return `<div class="w-cyc">${suggestionBox(info, o.date)}</div>`;
+}
+function renderCycleSettings() {
+  const c = cyc.settings;
+  let h = `<section class="panel stack"><h2 class="sec" style="margin:0">Cycle tracking</h2>${setRow('Track my cycle', 'Log your period and how you feel, see predictions, and get workout suggestions by phase. Only you can see it, even on calendars you share.', seg('cy-on', c.on ? 'on' : 'off', [['off', 'Off'], ['on', 'On']]))}`;
+  if (c.on) {
+    h += `<div class="m-row" style="align-items:end">
+      <label class="field" style="flex:1 1 170px"><span>Last period started</span><input type="date" id="cy-last" value="${esc(c.lastStart || '')}" max="${todayS()}"></label>
+      <label class="field" style="flex:1 1 130px"><span>Usual cycle length</span><select id="cy-len">${['', ...Array.from({ length: 25 }, (_, i) => String(i + 21))].map(v => `<option value="${v}"${String(c.cycleLength || '') === v ? ' selected' : ''}>${v ? v + ' days' : 'Not sure'}</option>`).join('')}</select></label>
+      <label class="field" style="flex:1 1 130px"><span>Usual period length</span><select id="cy-plen">${Array.from({ length: 9 }, (_, i) => String(i + 2)).map(v => `<option value="${v}"${String(c.periodLength || 5) === v ? ' selected' : ''}>${v} days</option>`).join('')}</select></label></div>`;
+    h += c.lastStart ? `<p class="muted" style="margin:0">Log each day on the Day view. Your averages so far: ${cycleStats().cycleLength}-day cycle, ${cycleStats().periodLength}-day period.</p>` : `<p class="muted" style="margin:0">Add when your last period started to see predictions.</p>`;
+  }
+  if (c.on || Object.keys(cyc.logs).length) h += `<div>${confirmCycleDel ? `<button class="btn" data-act="cy-del-cancel">Keep</button> <button class="btn danger solid" data-act="cy-del-confirm">Delete all cycle data</button>` : `<button class="btn danger" data-act="cy-del">Delete all cycle data</button>`}</div>`;
+  return h + '</section>';
+}
+let confirmCycleDel = false, cycOpen = false;
 
 function curObj() {
   if (view.mode !== 'doc') return null;
@@ -649,7 +758,7 @@ function renderYear() {
         const d = addDays(ws, i), s = iso(d);
         if (d.getMonth() !== mo) { h += '<span class="d out"></span>'; continue; }
         const evs = map[s] || [], hs = hol[s] || [];
-        const dots = (hs.length ? `<i style="--c:${hs.some(x => x.kind === 'hol') ? HOLIDAY_COLOR : BDAY_COLOR}"></i>` : '') + evs.slice(0, hs.length ? 2 : 3).map(e => `<i style="--c:${okColor(calOf(e).color)}"></i>`).join('');
+        const dots = (hs.length ? `<i class="${hs[0].predicted ? 'pred' : ''}" style="--c:${hs[0].kind === 'cycle' ? CYCLE_COLOR : hs.some(x => x.kind === 'hol') ? HOLIDAY_COLOR : BDAY_COLOR}"></i>` : '') + evs.slice(0, hs.length ? 2 : 3).map(e => `<i style="--c:${okColor(calOf(e).color)}"></i>`).join('');
         const label = longDate(d) + (hs.length ? `, ${hs.map(x => x.name).join(', ')}` : '') + (evs.length ? `, ${evs.length} event${evs.length > 1 ? 's' : ''}` : '');
         h += `<button class="d${s === t ? ' today' : ''}${i > 4 ? ' wkend' : ''}${hs.length ? ' hday' : ''}" data-act="day" data-date="${s}" title="${esc(hs.map(x => x.name).join(', '))}" aria-label="${esc(label)}">${d.getDate()}<span class="dots">${dots}</span></button>`;
       }
@@ -674,6 +783,7 @@ function renderDay() {
   const s = view.date, evs = byDate()[s] || [], hs = specialDays()[s] || [];
   let h = onboarding() + '<div class="day">';
   if (hs.length) h += `<div class="hol-day">${hs.map(specialChip).join('')}</div>`;
+  h += cycleCard(s);
   if (db.calendars.length) h += '<div class="quick">' + db.calendars.map(c => `<button class="btn" data-act="new" data-cal="${c.id}" data-date="${s}" style="--c:${okColor(c.color)}"><span class="dot"></span>+ ${esc(c.name || 'Untitled')}</button>`).join('') + '</div>';
   if (!evs.length) h += `<div class="empty">Nothing planned for this day.${db.calendars.length ? ' Add something with the buttons above.' : ''}</div>`;
   for (const e of evs) {
@@ -790,7 +900,7 @@ const notesBlock = (o, label, ph) => `<h2>${label}</h2><textarea class="notes" i
 
 function bodyWorkout(o) {
   const st = wStats(o), isT = view.kind === 'saved';
-  let h = `<div class="w-stats"><div><span>Duration</span><b>${duration(o)}</b></div><div><span>Volume</span><b id="st-vol">${st.vol}</b></div><div><span>Sets</span><b id="st-sets">${isT ? st.tot : `${st.done}/${st.tot}`}</b></div></div>`;
+  let h = workoutCycleBanner(o) + `<div class="w-stats"><div><span>Duration</span><b>${duration(o)}</b></div><div><span>Volume</span><b id="st-vol">${st.vol}</b></div><div><span>Sets</span><b id="st-sets">${isT ? st.tot : `${st.done}/${st.tot}`}</b></div></div>`;
   if (!o.data.exercises.length) h += `<div class="w-empty"><b>No exercises yet</b>Add exercises from your library to plan this workout.</div>`;
   o.data.exercises.forEach((x, ei) => {
     const inf = exInfo(x), [la, lb] = cols(inf.kind), prev = prevSets(x, o);
@@ -1243,6 +1353,7 @@ function renderSettings() {
     <div class="field"><span>Countries</span><div class="pick">${Object.entries(COUNTRIES).map(([c, n]) => `<button data-act="hol-cc" data-v="${c}" aria-pressed="${cc.includes(c)}">${esc(n)}</button>`).join('')}</div></div></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">News</h2>${setRow('Show news on the Day view', 'The latest top stories from NPR, BBC News and The Guardian, updated every time you open the app.', seg('news-on', p.news !== false ? 'on' : 'off', [['on', 'On'], ['off', 'Off']]))}</section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Workouts</h2>${setRow('Weight unit', 'Used on Workout pages.', seg('unit', db.unit, [['lb', 'lb'], ['kg', 'kg']]))}</section>`;
+  h += renderCycleSettings();
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Import from Excel</h2><p class="muted" style="margin:0">Add events from an .xlsx or .csv file. Workouts use Date, Exercise, Sets, Reps, Weight; other calendars use Date, Title, Time, Notes. You can check the columns before anything is added. On a computer you can also drag the file onto Almanac. Sample sheets: <button class="linkish" data-act="sample" data-kind="workout">workouts</button>, <button class="linkish" data-act="sample" data-kind="events">other calendars</button>.</p><label class="btn" style="align-self:flex-start">Choose a spreadsheet<input type="file" data-imp-cal="" accept="${IMPORT_ACCEPT}" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Bring over your Year Planner</h2><p class="muted" style="margin:0">In the old Year Planner, choose <b>Export my data</b> to download a file, then choose it here. Calendars, events, templates, formats and exercises are added; nothing here is replaced.</p><label class="btn" style="align-self:flex-start">Choose file<input type="file" id="imp-file" accept="application/json,.json" hidden></label></section>`;
   h += `<section class="panel stack"><h2 class="sec" style="margin:0">Put Almanac on your phone</h2>${standalone() ? '<p class="muted" style="margin:0">You’re using the installed app.</p>' : `${installEvt ? '<button class="btn primary" data-act="install" style="align-self:flex-start">Install Almanac</button>' : ''}<p class="muted" style="margin:0"><b>iPhone:</b> open this site in Safari, tap the Share button, then <b>Add to Home Screen</b>.<br><b>Android:</b> open the browser menu and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>`}</section>`;
@@ -1280,7 +1391,7 @@ function leaveDoc() {
   if (view.kind === 'saved') { const o = curObj(); if (o && isEmpty(o)) { db.saved = db.saved.filter(x => x !== o); save(); } }
   confirmDel = false;
 }
-function go(mode, date) { leaveDoc(); modal = null; view = { mode, date: date || view.date }; render(); window.scrollTo(0, 0); }
+function go(mode, date) { leaveDoc(); modal = null; cycOpen = false; view = { mode, date: date || view.date }; render(); window.scrollTo(0, 0); }
 function openDoc(kind, id) {
   const back = view.mode === 'doc' ? view.back : { mode: ['builder', 'settings', 'welcome'].includes(view.mode) ? 'week' : view.mode };
   leaveDoc(); modal = null;
@@ -1316,6 +1427,19 @@ document.addEventListener('click', ev => {
   switch (a) {
     case 'mode': go(ds.mode, view.date); break;
     case 'bills-toggle': billsOpen = !billsOpen; softRender(); break;
+    case 'cy-on': cyc.settings = { ...cyc.settings, on: ds.v === 'on' }; saveCycle([], true); render(); if (ds.v === 'on' && !cyc.settings.lastStart) $('cy-last')?.focus(); break;
+    case 'cy-flow': case 'cy-energy': case 'cy-mood': case 'cy-sleep': {
+      const k = { 'cy-flow': 'period', 'cy-energy': 'energy', 'cy-mood': 'mood', 'cy-sleep': 'sleep' }[a], d = view.date, cur = cyc.logs[d]?.[k];
+      const v = a === 'cy-energy' ? +ds.v : ds.v;
+      setLog(d, { [k]: String(cur ?? '') === String(v) ? '' : v });
+      if (k === 'period' && v && !cyc.settings.lastStart) { cyc.settings.lastStart = d; saveCycle([], true); }
+      softRender(); break;
+    }
+    case 'cy-sym': { const d = view.date, cur = new Set(cyc.logs[d]?.symptoms || []); cur.has(ds.v) ? cur.delete(ds.v) : cur.add(ds.v); setLog(d, { symptoms: [...cur] }); softRender(); break; }
+    case 'cy-open': cycOpen = !cycOpen; softRender(); break;
+    case 'cy-del': confirmCycleDel = true; render(); break;
+    case 'cy-del-cancel': confirmCycleDel = false; render(); break;
+    case 'cy-del-confirm': { confirmCycleDel = false; const dates = Object.keys(cyc.logs); cyc = CYCLE_BLANK(); saveCycle(dates, true); render(); toast('Cycle data deleted'); break; }
     case 'fcal-toggle': { const cur = db.prefs.friendCals || {}; db.prefs.friendCals = { ...cur, [ds.id]: cur[ds.id] === false }; fcCache = null; save(); render(); break; }
     case 'bday-toggle': db.prefs.birthdays = !birthdaysOn(); save(); render(); break;
     case 'share': { const c = db.calendars.find(x => x.id === ds.id); if (!c) break; c.sharing = ds.v === 'friends' ? 'friends' : 'private'; save(); render(); toast(c.sharing === 'friends' ? `Friends can now see ${c.name || 'this calendar'}` : `${c.name || 'This calendar'} is private`); break; }
@@ -1494,6 +1618,8 @@ document.addEventListener('click', ev => {
 /* ---------- typing ---------- */
 document.addEventListener('input', ev => {
   const t = ev.target, ds = t.dataset;
+  if (t.id === 'cy-last' && t.value) { cyc.settings = { ...cyc.settings, lastStart: t.value }; saveCycle([], true); return; }
+  if (t.id === 'cy-len' || t.id === 'cy-plen') { cyc.settings = { ...cyc.settings, [t.id === 'cy-len' ? 'cycleLength' : 'periodLength']: t.value ? +t.value : null }; saveCycle([], true); return; }
   if (t.id === 'pf-name') { saveProfileSoon({ display_name: t.value }); return; }
   if (t.id === 'pf-month' || t.id === 'pf-day') { saveProfileSoon({ [t.id === 'pf-month' ? 'birthday_month' : 'birthday_day']: t.value ? +t.value : null }); return; }
   if (modal?.type === 'import') {
@@ -1577,6 +1703,8 @@ document.addEventListener('submit', ev => {
 });
 document.addEventListener('change', ev => {
   const t = ev.target;
+  if (t.id === 'cy-last' && view.mode === 'settings') setTimeout(() => softRender(), 0);   // waits for the date picker to close
+  if ((t.id === 'cy-len' || t.id === 'cy-plen') && view.mode === 'settings') { const y = scrollY; render(); scrollTo(0, y); }
   if (t.id === 'imp-file' && t.files?.[0]) importFile(t.files[0]);
   if (t.dataset.impCal !== undefined && t.files?.[0]) { startImport(t.files[0], t.dataset.impCal); t.value = ''; }
 });
