@@ -4,6 +4,7 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 import { holidaysFor, COUNTRIES } from './holidays.js';
 import { readTable, prepare, planWorkouts, planEvents, FIELDS, SAMPLE_CSV } from './importer.js';
 import * as Cycle from './cycle.js';
+import * as Prog from './progress.js';
 
 /* ---------- constants ---------- */
 const WD = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
@@ -306,7 +307,7 @@ function listen() {
   for (const table of ['friend_requests', 'profiles']) channel.on('postgres_changes', { event: '*', schema: 'public', table }, loadSocialSoon);
   channel.subscribe();
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) { pullSoon(); loadSocialSoon(); pullCycle(); } loadNews(); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (user) { pullSoon(); loadSocialSoon(); pullCycle(); } loadNews(); refreshFeeds(); } });
 window.addEventListener('online', () => { if (user) { pullSoon(); flush(); } });
 
 function startSession(u) {
@@ -325,14 +326,17 @@ function startSession(u) {
     cyc = (!mineC.settings.on && !Object.keys(mineC.logs).length && (guestC.settings.on || Object.keys(guestC.logs).length)) ? guestC : mineC;
     if (cyc === guestC) { try { localStorage.removeItem(cycleKey(GUEST)); } catch (e) {} }
     cycStats = null; cycDirty = new Set(); cycProfileDirty = false; }
+  feedData = loadFeedData(u.id); feedVer++;
   remSynced = null; checkPush();
   render(); pull(); listen(); loadNews(); loadSocial().then(useInvite); pullCycle();
+  setTimeout(refreshFeeds, 1500);
 }
 function endSession() {
   if (channel) { supa.removeChannel(channel); channel = null; }
   user = null; ready = false; owner = GUEST; db = loadLocal(GUEST);
   synced = { settings: null, calendars: {}, events: {}, saved: {} };
   cyc = loadCycleLocal(GUEST); cycStats = null; cycDirty = new Set(); cycProfileDirty = false;
+  feedData = loadFeedData(GUEST); feedVer++;
   news = {}; social = { me: null, requests: [], people: {}, cals: [], events: [] }; fcCache = feCache = null; applyTheme();
 }
 
@@ -345,8 +349,8 @@ let libTab = 'formats', libQ = '', libMuscle = '';
 let newCal = { color: SWATCHES[0], format: 'notes' };
 
 const $ = id => document.getElementById(id);
-const calOf = o => o._friend ? friendCals().find(c => c.id === o.calId) : db.calendars.find(c => c.id === o.calId);
-const visibleEvents = () => [...db.events, ...friendEvents()].filter(e => { const c = calOf(e); return c && !c.hidden; });
+const calOf = o => o._friend ? friendCals().find(c => c.id === o.calId) : o._feed ? feedCals().find(c => c.id === o.calId) : db.calendars.find(c => c.id === o.calId);
+const visibleEvents = () => [...db.events, ...friendEvents(), ...feedEvents()].filter(e => { const c = calOf(e); return c && !c.hidden; });
 /* ---------- repeating events ---------- */
 // A repeating event is stored once with a `repeat` rule. Its later dates are drawn from the rule;
 // opening one of them turns that day into its own event (so a workout's sets are tracked per day).
@@ -543,6 +547,135 @@ function specialDays() {
   return m;
 }
 const specialChip = x => x.kind === 'bday' ? bdayChip(x) : x.kind === 'cycle' ? cycleChip(x) : holChip(x);
+
+/* ---------- calendars linked from Google, Apple and other apps (read only) ---------- */
+// Each linked calendar is a private iCal link kept in your settings. /api/ics reads it and returns the events;
+// this device keeps the last copy so they show offline, and reads it again every 15 minutes while the app is open.
+const FEED_KINDS = { google: 'Google Calendar', apple: 'Apple Calendar', other: 'Calendar link' };
+const FEED_STALE = 15 * 60e3;
+const feedsKey = who => `almanac-feeds:${who}`;
+function loadFeedData(who) { try { const x = JSON.parse(localStorage.getItem(feedsKey(who))); if (x && typeof x === 'object') return x; } catch (e) {} return {}; }
+let feedData = loadFeedData(GUEST), feedBusy = new Set(), feedVer = 0, fdCache = null, feedForm = { kind: 'google', busy: false, err: '' }, confirmFeed = null;
+const saveFeedData = () => { feedVer++; try { localStorage.setItem(feedsKey(owner), JSON.stringify(feedData)); } catch (e) {} };
+const feeds = () => Array.isArray(db.prefs.feeds) ? db.prefs.feeds : [];
+const feedCals = () => feeds().map(f => ({ id: 'g:' + f.id, name: f.name || FEED_KINDS[f.kind] || 'Calendar', color: f.color, format: 'notes', feed: f, hidden: !!f.hidden }));
+const hash = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = (h * 33 ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
+const hm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+function feedEvents() {
+  const key = feeds().map(f => f.id).join() + ':' + feedVer;
+  if (fdCache?.key === key) return fdCache.list;
+  const out = [], seen = new Set();
+  for (const f of feeds()) {
+    const d = feedData[f.id];
+    if (!d?.events) { if (!feedBusy.has(f.id) && !d?.at) setTimeout(() => refreshFeed(f), 0); continue; }
+    for (const x of d.events) {
+      let id = `g:${f.id}:${hash((x.uid || x.title || '') + '|' + (x.start || x.date))}`;
+      while (seen.has(id)) id += '+';
+      seen.add(id);
+      const base = { calId: 'g:' + f.id, title: x.title || 'Busy', format: 'notes', data: { notes: x.notes || '' }, location: x.location || '', _feed: f.id };
+      if (x.allDay) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(x.date || '')) continue;
+        const n = Math.max(1, Math.min(62, daysBetween(x.date, x.endDate || x.date)));
+        for (let k = 0; k < n; k++) out.push({ ...base, id: k ? `${id}~${k}` : id, date: iso(addDays(parse(x.date), k)), start: '', end: '', first: x.date, endDate: x.endDate || '' });
+      } else {
+        const st = new Date(x.start), en = x.end ? new Date(x.end) : null;   // "2026-10-20T08:00" (no zone) reads as this device's time
+        if (isNaN(st)) continue;
+        const sameDay = en && !isNaN(en) && iso(en) === iso(st);
+        out.push({ ...base, id, date: iso(st), start: hm(st), end: sameDay ? hm(en) : '', until: en && !isNaN(en) && !sameDay ? en.toISOString() : '' });
+      }
+    }
+  }
+  fdCache = { key, list: out };
+  return out;
+}
+const FEED_ERRORS = {
+  link: 'That doesn’t look like a calendar link. It should start with webcal:// or https://.',
+  gone: 'That link didn’t open. It may have been turned off, or only part of it was copied. Copy it again.',
+  notcal: 'That link opened a web page, not a calendar. Copy the iCal or public calendar link instead.',
+  big: 'That calendar is too big to load.',
+  down: 'Couldn’t reach that calendar just now. Try again in a minute.',
+};
+async function fetchFeed(url) {
+  const now = new Date(), from = new Date(now.getFullYear() - 1, 0, 1).getTime(), to = new Date(now.getFullYear() + 2, 0, 1).getTime();
+  try {
+    const res = await fetch('/api/ics', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url, from, to }) });
+    const j = await res.json().catch(() => ({}));
+    return res.ok && Array.isArray(j.events) ? { events: j.events, name: j.name || '' } : { error: FEED_ERRORS[j.error] ? j.error : 'down' };
+  } catch (e) { return { error: 'down' }; }
+}
+async function refreshFeed(f, force) {
+  const d = feedData[f.id];
+  if (feedBusy.has(f.id) || (!force && d?.at && Date.now() - d.at < FEED_STALE)) return;
+  feedBusy.add(f.id);
+  if (force) softRender();
+  const got = await fetchFeed(f.url);
+  feedBusy.delete(f.id);
+  if (!feeds().some(x => x.id === f.id)) return;
+  feedData[f.id] = got.error ? { ...(d || {}), at: Date.now(), error: got.error } : { at: Date.now(), events: got.events, name: got.name };
+  saveFeedData(); softRender();
+}
+const refreshFeeds = force => Promise.all(feeds().map(f => refreshFeed(f, force)));
+setInterval(() => { if (document.visibilityState === 'visible') refreshFeeds(); }, 5 * 60e3);
+async function addFeed() {
+  const url = $('fd-url')?.value.trim() || '', name = $('fd-name')?.value.trim() || '';
+  if (!/^(webcals?|https?):\/\/\S+$/i.test(url)) { feedForm = { ...feedForm, url, name, err: FEED_ERRORS.link }; render(); return; }
+  if (feeds().some(f => f.url === url)) { feedForm = { ...feedForm, url, name, err: 'That calendar is already linked.' }; render(); return; }
+  feedForm = { ...feedForm, busy: true, err: '', url, name }; render();
+  const got = await fetchFeed(url);
+  if (got.error) { feedForm = { ...feedForm, busy: false, err: FEED_ERRORS[got.error] }; render(); return; }
+  const used = new Set([...db.calendars, ...feeds()].map(c => c.color));
+  const f = { id: uid(), kind: feedForm.kind, url, name: name || got.name || FEED_KINDS[feedForm.kind], color: SWATCHES.find(c => !used.has(c)) || SWATCHES[feeds().length % SWATCHES.length] };
+  db.prefs.feeds = [...feeds(), f];
+  feedData[f.id] = { at: Date.now(), events: got.events, name: got.name };
+  saveFeedData(); save();
+  feedForm = { kind: feedForm.kind, busy: false, err: '' };
+  render();
+  toast(`${f.name} linked · ${got.events.length} event${got.events.length === 1 ? '' : 's'}`);
+}
+const ago = t => { const m = Math.round((Date.now() - t) / 60e3); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+const FEED_HOWTO = {
+  google: `<ol><li>On a computer, open <a href="https://calendar.google.com/calendar/r/settings" target="_blank" rel="noopener">Google Calendar settings</a>.</li><li>Under <b>Settings for my calendars</b> on the left, click the calendar you want.</li><li>Choose <b>Integrate calendar</b> and copy <b>Secret address in iCal format</b>.</li></ol><p class="muted">Google refreshes this link on its side every few hours, so a brand-new Google event can take a while to show up here.</p>`,
+  apple: `<ol><li>On iPhone, open the <b>Calendar</b> app and tap <b>Calendars</b> at the bottom.</li><li>Tap <b>ⓘ</b> next to the calendar you want and turn on <b>Public Calendar</b>.</li><li>Tap <b>Share Link…</b>, then <b>Copy</b>.</li></ol><p class="muted">On a Mac: in Calendar, Control-click the calendar, choose <b>Share Calendar…</b>, tick <b>Public Calendar</b> and copy the link.</p>`,
+  other: `<p>Paste any iCal link (it often starts with <b>webcal://</b> or ends in <b>.ics</b>), for example from Outlook, a school or a sports team.</p>`,
+};
+function renderFeeds() {
+  let h = `<h2 class="sec">From Google or Apple Calendar</h2><p class="muted">Show events from your other calendars next to your own. They’re read only here: change them in Google or Apple Calendar and Almanac picks up the change on its own.</p><div class="stack">`;
+  for (const f of feeds()) {
+    const d = feedData[f.id] || {}, busy = feedBusy.has(f.id), n = d.events?.length || 0;
+    const status = busy ? 'Updating…' : d.error ? `<span class="warn">${esc(FEED_ERRORS[d.error] || FEED_ERRORS.down)}</span>${d.events ? ` Showing the copy from ${ago(d.at)}.` : ''}` : d.at ? `${n} event${n === 1 ? '' : 's'} · updated ${ago(d.at)}` : 'Not loaded yet';
+    h += `<div class="panel calrow feedrow" style="--c:${okColor(f.color)}"><div class="fields">
+      <label class="field" style="flex:1 1 180px"><span>Name</span><input data-feed="${f.id}" value="${esc(f.name)}" placeholder="${esc(FEED_KINDS[f.kind] || 'Calendar')}"></label>
+      <div class="field"><span>Color</span><div class="swatches">${SWATCHES.map(s => `<button class="sw" style="--c:${s}" data-act="feed-color" data-id="${f.id}" data-color="${s}" aria-pressed="${s === f.color}" aria-label="Color ${s}"></button>`).join('')}</div></div>
+    </div><p class="muted feed-st">${esc(FEED_KINDS[f.kind] || 'Calendar link')} · ${status}</p>
+    <div class="grp" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button class="btn" data-act="feed-refresh" data-id="${f.id}"${busy ? ' disabled' : ''}>Refresh now</button>
+      ${confirmFeed === f.id ? `<button class="btn" data-act="feed-del-cancel">Keep</button><button class="btn danger solid" data-act="feed-del-confirm" data-id="${f.id}">Unlink calendar</button>` : `<button class="btn danger" data-act="feed-del" data-id="${f.id}">Unlink</button>`}</div></div>`;
+  }
+  const k = feedForm.kind;
+  h += `<div class="panel feed-add"><h2 class="sec" style="margin-top:0">Link a calendar</h2>${seg('feed-kind', k, [['google', 'Google'], ['apple', 'Apple'], ['other', 'Other link']])}
+    <div class="feed-how">${FEED_HOWTO[k]}</div>
+    <div class="m-row" style="align-items:end"><label class="field" style="flex:2 1 260px"><span>Calendar link</span><input id="fd-url" value="${esc(feedForm.url || '')}" placeholder="${k === 'apple' ? 'webcal://p…-caldav.icloud.com/published/…' : k === 'google' ? 'https://calendar.google.com/calendar/ical/…/basic.ics' : 'webcal://… or https://….ics'}" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <label class="field" style="flex:1 1 160px"><span>Name (optional)</span><input id="fd-name" value="${esc(feedForm.name || '')}" placeholder="e.g. Work"></label></div>
+    ${feedForm.err ? `<p class="auth-err">${esc(feedForm.err)}</p>` : ''}
+    <p class="muted">Anyone who has this link can see that calendar, so keep it to yourself. Almanac keeps it only in your private settings.</p>
+    <div><button class="btn primary" data-act="feed-add"${feedForm.busy ? ' disabled' : ''}>${feedForm.busy ? 'Checking the link…' : 'Link calendar'}</button></div></div>`;
+  return h + '</div>';
+}
+function renderFeedDoc(o) {
+  const c = calOf(o), f = c?.feed, kind = FEED_KINDS[f?.kind] || 'Calendar link';
+  const back = { year: 'Year', week: 'Week', day: 'Day', calendars: 'Calendars' }[view.back.mode] || 'Week';
+  let when;
+  if (o.first && o.endDate && daysBetween(o.first, o.endDate) > 1) when = `${longDate(parse(o.first))} – ${longDate(addDays(parse(o.endDate), -1))}`;
+  else if (o.until) when = `${longDate(parse(o.date))}, ${fmtTime(o.start)} – ${longDate(new Date(o.until))}, ${fmtTime(hm(new Date(o.until)))}`;
+  else when = `${longDate(parse(o.date))} · ${o.start ? fmtTime(o.start) + (o.end ? ' – ' + fmtTime(o.end) : '') : 'All day'}`;
+  const linkify = s => s.replace(/https:\/\/[^\s<]+/g, u => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+  return `<article class="doc fmt-notes ro-doc" style="--c:${okColor(c?.color)}">
+    <div class="doc-top"><button class="back" data-act="back">‹ ${back}</button><span class="eyebrow">${icon('notes')}${esc(kind)} · ${esc(c?.name || '')}</span></div>
+    <h1 class="ttl ro">${esc(o.title || 'Busy')}</h1>
+    <p class="ro-when">${esc(when)}</p>
+    ${o.location ? `<p class="feed-loc">${esc(o.location)}</p>` : ''}
+    ${o.data.notes ? `<div class="feed-notes">${linkify(esc(o.data.notes))}</div>` : ''}
+    <p class="ro-note">This event comes from your ${esc(kind)}. Change it there and Almanac picks up the change on its own.</p></article>`;
+}
 
 /* ---------- cycle tracking (opt-in, private: its own tables that only you can read) ---------- */
 const CYCLE_BLANK = () => ({ settings: { on: false }, logs: {} });
@@ -769,6 +902,7 @@ function curObj() {
     const [fid, date] = String(view.id).split('@'), e = friendEvents().find(x => x.id === fid);
     return e && date ? { ...e, id: view.id, date, _occ: e.id, ...(e.format === 'bill' ? { data: { ...e.data, paid: '' } } : {}) } : e;
   }
+  if (view.kind === 'feed') return feedEvents().find(x => x.id === view.id);
   return (view.kind === 'saved' ? db.saved : db.events).find(x => x.id === view.id);
 }
 let toastT;
@@ -809,6 +943,85 @@ function duration(o) {
   return (m >= 60 ? Math.floor(m / 60) + 'h ' : '') + (m % 60 ? (m % 60) + 'min' : '').trim();
 }
 
+/* ---------- progress (workouts, opened on demand) ---------- */
+const PROG_RANGES = { '3m': ['3 months', 13], '6m': ['6 months', 26], '1y': ['1 year', 52], all: ['All time', 0] };
+const exKey = x => x.exId ? 'id:' + x.exId : 'n:' + String(x.name || '').trim().toLowerCase();
+const progInfo = x => { const i = exInfo(x); return { key: exKey(x), name: i.name, kind: i.kind, muscle: i.muscle }; };
+const PROG_METRICS = {
+  weight: [['top', 'Heaviest'], ['best1rm', 'Est. 1-rep max'], ['volume', 'Volume']],
+  reps: [['maxReps', 'Most reps'], ['volume', 'Total reps']],
+  cardio: [['distance', 'Distance']],
+  time: [],
+};
+const RECORD_FIELD = { top: 'top', best1rm: 'best1rm', volume: 'volume', maxReps: 'maxReps', distance: 'distance' };
+let prog = { range: '6m', ex: '', metric: '', wk: 'volume' };
+const fmtNum = n => (Math.round(n * 10) / 10).toLocaleString();
+function recText(h, f, v) {
+  if (!v) return '—';
+  if (f === 'top') return `${fmtNum(v.value)} ${db.unit} × ${v.reps}`;
+  if (f === 'maxReps' || (f === 'volume' && h.kind === 'reps')) return `${fmtNum(v.value)} reps`;
+  if (f === 'distance') return fmtNum(v.value);
+  return `${fmtNum(v.value)} ${db.unit}`;
+}
+const metricText = (h, f, s) => f === 'top' ? `${fmtNum(s.top)} ${db.unit} × ${s.topReps}` : recText(h, f, { value: s[f] });
+// A line chart: the line is SVG, the dots and labels are HTML so they stay round and readable at any width.
+function lineChart(pts, h, f) {
+  const xs = pts.map(p => parse(p.date).getTime()), x0 = Math.min(...xs), x1 = Math.max(...xs);
+  let y0 = Math.min(...pts.map(p => p.y)), y1 = Math.max(...pts.map(p => p.y));
+  const padY = (y1 - y0) * 0.2 || Math.max(1, y1 * 0.1); y0 = Math.max(0, y0 - padY); y1 += padY;
+  const X = t => x1 === x0 ? 50 : 3 + (t - x0) / (x1 - x0) * 94, Y = v => 4 + (1 - (v - y0) / (y1 - y0)) * 92;
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${X(xs[i]).toFixed(2)} ${Y(p.y).toFixed(2)}`).join(' ');
+  return `<div class="lc"><div class="lc-y">${[y1, (y0 + y1) / 2, y0].map(v => `<span style="top:${Y(v)}%">${fmtNum(v)}</span>`).join('')}</div>
+    <div class="lc-plot"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${[y1, (y0 + y1) / 2, y0].map(v => `<line x1="0" x2="100" y1="${Y(v)}" y2="${Y(v)}" class="lc-g"/>`).join('')}<path d="${d}"/></svg>
+    ${pts.map((p, i) => `<button class="lc-pt${p.pr ? ' pr' : ''}" style="left:${X(xs[i])}%;top:${Y(p.y)}%" data-act="open" data-id="${p.id}" title="${esc(shortDate(parse(p.date)))}: ${esc(p.label)}${p.pr ? ' (record)' : ''}" aria-label="${esc(shortDate(parse(p.date)))}: ${esc(p.label)}"></button>`).join('')}</div>
+    <div class="lc-x"><span>${shortDate(parse(pts[0].date))}</span>${pts.length > 1 ? `<span>${shortDate(parse(pts[pts.length - 1].date))}</span>` : ''}</div></div>`;
+}
+function weekBars(list) {
+  const k = prog.wk, val = w => w[k], max = Math.max(1, ...list.map(val)), every = Math.ceil(list.length / 6), now = Prog.weekOf(todayS());
+  const unit = k === 'volume' ? db.unit : k === 'sets' ? 'sets' : 'workouts';
+  return `<div class="wb" style="--n:${list.length}">${list.map(w => `<div class="wb-c${w.week === now ? ' now' : ''}" title="Week of ${shortDate(parse(w.week))}: ${val(w).toLocaleString()} ${unit}"><i style="height:${Math.max(val(w) ? 2 : 0, val(w) / max * 100)}%"></i></div>`).join('')}</div>
+    <div class="wb wb-x" style="--n:${list.length}">${list.map((w, i) => `<span>${i % every === 0 ? shortDate(parse(w.week)) : ''}</span>`).join('')}</div>`;
+}
+function renderProgress() {
+  const today = todayS(), hist = Prog.history(db.events, progInfo);
+  let h = `<div class="page prog"><h1>Progress</h1><p class="lede">Built from the sets you tick off in your workouts. Warm-up sets count toward volume but not toward records.</p>`;
+  if (!hist.length) return h + `<div class="empty">No finished sets yet. Open a workout and tick ✓ next to each set as you finish it. Your weights, records and weekly volume will show up here.</div></div>`;
+  const firstDate = hist.reduce((m, x) => x.sessions[0].date < m ? x.sessions[0].date : m, today);
+  const weeksN = PROG_RANGES[prog.range][1] || Math.min(156, Math.max(4, Math.ceil(daysBetween(Prog.weekOf(firstDate), today) / 7) + 1));
+  const wk = Prog.weekly(db.events, progInfo, weeksN, today), from = wk[0].week;
+  const tot = wk.reduce((t, w) => ({ workouts: t.workouts + w.workouts, sets: t.sets + w.sets, volume: t.volume + w.volume }), { workouts: 0, sets: 0, volume: 0 });
+  h += `<div class="prog-top">${seg('prog-range', prog.range, Object.entries(PROG_RANGES).map(([k, [n]]) => [k, n]))}</div>
+    <div class="tiles"><div><span>Workouts</span><b>${tot.workouts}</b></div><div><span>Sets</span><b>${tot.sets.toLocaleString()}</b></div><div><span>Volume</span><b>${tot.volume.toLocaleString()} ${db.unit}</b></div></div>`;
+  h += `<section class="panel prog-sec"><div class="prog-h"><h2>Weekly ${{ volume: 'volume', sets: 'sets', workouts: 'workouts' }[prog.wk]}</h2>${seg('prog-wk', prog.wk, [['volume', 'Volume'], ['sets', 'Sets'], ['workouts', 'Workouts']])}</div>
+    ${weekBars(wk)}<p class="muted">This week: ${wk[wk.length - 1][prog.wk].toLocaleString()} ${prog.wk === 'volume' ? db.unit : prog.wk}. Weekly average: ${Math.round(wk.reduce((t, w) => t + w[prog.wk], 0) / wk.length).toLocaleString()}.</p></section>`;
+
+  const sorted = [...hist].sort((a, b) => b.sessions.length - a.sessions.length || a.name.localeCompare(b.name));
+  const cur = hist.find(x => x.key === prog.ex) || sorted[0];
+  const metrics = PROG_METRICS[cur.kind] || [], metric = metrics.some(([k]) => k === prog.metric) ? prog.metric : metrics[0]?.[0];
+  const rec = Prog.records(cur), prDates = new Set(rec.broken.filter(b => b.field === RECORD_FIELD[metric]).map(b => b.eventId));
+  const inRange = cur.sessions.filter(s => s.date >= from);
+  h += `<section class="panel prog-sec"><div class="prog-h"><h2>By exercise</h2><label class="field prog-pick"><span class="sr">Exercise</span><select id="prog-ex">${sorted.map(x => `<option value="${esc(x.key)}"${x === cur ? ' selected' : ''}>${esc(x.name)} (${x.sessions.length})</option>`).join('')}</select></label></div>`;
+  if (metrics.length > 1) h += seg('prog-metric', metric, metrics);
+  const pts = metric ? inRange.filter(s => s[metric] > 0).map(s => ({ date: s.date, y: s[metric], id: s.eventId, label: metricText(cur, metric, s), pr: prDates.has(s.eventId) })) : [];
+  if (!metric) h += `<p class="muted">Charts for timed exercises are coming later. Your sessions are listed below.</p>`;
+  else if (pts.length) h += lineChart(pts, cur, metric) + (prDates.size ? `<p class="muted lc-key"><i class="lc-dot pr"></i> New record</p>` : '');
+  else h += `<p class="muted">No ${esc(cur.name)} sessions in this time range.</p>`;
+  const tiles = cur.kind === 'weight' ? [['Heaviest set', 'top'], ['Est. 1-rep max', 'best1rm'], ['Best session volume', 'volume']] : cur.kind === 'reps' ? [['Most reps in a set', 'maxReps'], ['Most reps in a session', 'volume']] : cur.kind === 'cardio' ? [['Longest distance', 'distance']] : [];
+  h += `<div class="tiles recs">${tiles.map(([n, f]) => `<div><span>${n}</span><b>${esc(recText(cur, f, rec[f]))}</b>${rec[f] ? `<em>${shortDate(parse(rec[f].date))}</em>` : ''}</div>`).join('')}<div><span>Sessions</span><b>${cur.sessions.length}</b><em>since ${shortDate(parse(cur.sessions[0].date))}</em></div></div>`;
+  const recent = cur.sessions.slice(-6).reverse();
+  h += `<h3 class="prog-sub">Recent sessions</h3><div class="prog-list">${recent.map(s => `<button data-act="open" data-id="${s.eventId}"><span>${shortDate(parse(s.date))}</span><b>${esc(cur.kind === 'weight' && s.top ? `${fmtNum(s.top)} ${db.unit} × ${s.topReps}` : cur.kind === 'reps' ? `${s.maxReps} reps` : cur.kind === 'cardio' && s.distance ? fmtNum(s.distance) : '')}</b><em>${s.sets} set${s.sets === 1 ? '' : 's'}${cur.kind === 'weight' && s.volume ? ` · ${Math.round(s.volume).toLocaleString()} ${db.unit}` : ''}</em></button>`).join('')}</div></section>`;
+
+  const broken = hist.flatMap(x => Prog.records(x).broken.filter(b => b.field !== 'volume').map(b => ({ ...b, x }))).filter(b => b.date >= iso(addDays(new Date(), -30))).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 8);
+  const label = { top: 'Heaviest', best1rm: 'Est. 1-rep max', maxReps: 'Most reps', distance: 'Distance' };
+  h += `<section class="panel prog-sec"><h2>Personal records</h2>`;
+  if (broken.length) h += `<h3 class="prog-sub">New in the last 30 days</h3><div class="prog-list prs">${broken.map(b => `<button data-act="open" data-id="${b.eventId}"><span>${shortDate(parse(b.date))}</span><b>${esc(b.x.name)}</b><em>${label[b.field]} ${esc(recText(b.x, b.field, b))}, up from ${esc(recText(b.x, b.field, { value: b.before, reps: b.beforeReps }))}</em></button>`).join('')}</div>`;
+  h += `<div class="prog-tbl" role="table"><div class="pt-r h" role="row"><span role="columnheader">Exercise</span><span role="columnheader">Best</span><span role="columnheader">Est. 1RM</span><span role="columnheader">Set on</span></div>${sorted.map(x => {
+    const r = Prog.records(x), main = x.kind === 'weight' ? 'top' : x.kind === 'reps' ? 'maxReps' : x.kind === 'cardio' ? 'distance' : null, best = main && r[main];
+    return `<button class="pt-r${x === cur ? ' on' : ''}" role="row" data-act="prog-ex" data-key="${esc(x.key)}"><span role="cell">${esc(x.name)}</span><span role="cell">${best ? esc(recText(x, main, best)) : '—'}</span><span role="cell">${r.best1rm ? esc(recText(x, 'best1rm', r.best1rm)) : '—'}</span><span role="cell">${best ? shortDate(parse(best.date)) : ''}</span></button>`;
+  }).join('')}</div></section>`;
+  return h + '</div>';
+}
+
 /* ---------- bills ---------- */
 const amountOf = v => parseFloat(String(v ?? '').replace(/[^0-9.\-]/g, '')) || 0;
 const money = v => { const n = typeof v === 'number' ? v : amountOf(v); return n || String(v ?? '').trim() ? n.toLocaleString(undefined, { style: 'currency', currency: 'USD' }) : ''; };
@@ -830,6 +1043,7 @@ function billsBar(y, mo, map) {
 /* ---------- summaries ---------- */
 function summary(e) {
   const d = e.data || {};
+  if (e._feed) return [e.location, (d.notes || '').split('\n')[0]].filter(Boolean).join(' · ');
   switch (e.format) {
     case 'workout': { const s = wStats(e); const n = d.exercises.length; return n ? `${n} exercise${n > 1 ? 's' : ''} · ${s.tot} sets${s.done ? ` · ${s.done} done` : ''}` : ''; }
     case 'birthday': return [d.person && (d.person + (d.turning ? ` turns ${d.turning}` : '')), d.gifts.length && `${d.gifts.length} gift idea${d.gifts.length > 1 ? 's' : ''}`].filter(Boolean).join(' · ');
@@ -846,7 +1060,7 @@ function summary(e) {
 
 /* ---------- header ---------- */
 function renderSub() {
-  for (const m of ['year', 'week', 'day', 'library', 'calendars', 'friends', 'settings']) $('m-' + m).setAttribute('aria-pressed', view.mode === m || (m === 'library' && view.mode === 'builder'));
+  for (const m of ['year', 'week', 'day', 'library', 'progress', 'calendars', 'friends', 'settings']) $('m-' + m).setAttribute('aria-pressed', view.mode === m || (m === 'library' && view.mode === 'builder'));
   if (!['year', 'week', 'day'].includes(view.mode)) { $('sub').hidden = true; return; }
   $('sub').hidden = false;
   const d = parse(view.date);
@@ -855,7 +1069,7 @@ function renderSub() {
   if (view.mode === 'week') { const ws = startOfWeek(d), we = addDays(ws, 6); title = `<small>Week ${isoWeek(ws)}</small>${shortDate(ws)} – ${shortDate(we)}, ${we.getFullYear()}`; }
   if (view.mode === 'day') title = `<small>Week ${isoWeek(d)}</small>${longDate(d)}`;
   let h = `<h1>${title}</h1><div class="navs"><button class="btn icon" data-act="nav" data-dir="-1" aria-label="Previous">‹</button><button class="btn" data-act="today">Today</button><button class="btn icon" data-act="nav" data-dir="1" aria-label="Next">›</button></div>`;
-  h += `<div class="legend" aria-label="Show calendars">` + db.calendars.map(c => `<button data-act="cal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name || 'Untitled')}</button>`).join('') + friendCals().map(c => `<button data-act="fcal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(firstName(c.owner))} · ${esc(c.name)}</button>`).join('') + `<button data-act="hol-toggle" aria-pressed="${holidaysOn()}" style="--c:${HOLIDAY_COLOR}"><span class="dot"></span>Holidays</button>${user && friendIds().length ? `<button data-act="bday-toggle" aria-pressed="${birthdaysOn()}" style="--c:${BDAY_COLOR}"><span class="dot"></span>Birthdays</button>` : ''}</div>`;
+  h += `<div class="legend" aria-label="Show calendars">` + db.calendars.map(c => `<button data-act="cal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name || 'Untitled')}</button>`).join('') + friendCals().map(c => `<button data-act="fcal-toggle" data-id="${c.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(firstName(c.owner))} · ${esc(c.name)}</button>`).join('') + feedCals().map(c => `<button data-act="feed-toggle" data-id="${c.feed.id}" aria-pressed="${!c.hidden}" style="--c:${okColor(c.color)}"><span class="dot"></span>${esc(c.name)}</button>`).join('') + `<button data-act="hol-toggle" aria-pressed="${holidaysOn()}" style="--c:${HOLIDAY_COLOR}"><span class="dot"></span>Holidays</button>${user && friendIds().length ? `<button data-act="bday-toggle" aria-pressed="${birthdaysOn()}" style="--c:${BDAY_COLOR}"><span class="dot"></span>Birthdays</button>` : ''}</div>`;
   $('sub').innerHTML = h;
 }
 const onboarding = () => db.calendars.length ? '' : `<div class="banner"><div><h2>Make your first calendar</h2><p>Calendars hold your events, like Workouts, School or Family. You choose the name, the color and which Library format its events use.</p></div><button class="btn primary" data-act="mode" data-mode="calendars">Create a calendar</button></div>`;
@@ -1006,7 +1220,7 @@ function renderCalendars() {
     <label class="field" style="flex:1 1 160px"><span>Default format</span><select id="nc-format"><option value="__blank"${newCal.format === '__blank' ? ' selected' : ''}>Blank – design my own</option>${fmtOpts(newCal.format)}</select></label></div>
     <div class="field"><span>Color</span><div class="swatches">${SWATCHES.map(s => `<button class="sw" style="--c:${s}" data-act="nc-color" data-color="${s}" aria-pressed="${s === newCal.color}" aria-label="Color ${s}"></button>`).join('')}</div></div>
     <div><button class="btn primary" data-act="nc-create">Create calendar</button></div></div></div>`;
-  return h + '</div></div>';
+  return h + '</div>' + renderFeeds() + '</div>';
 }
 
 /* ---------- event page ---------- */
@@ -1024,7 +1238,7 @@ function bodyWorkout(o) {
     const inf = exInfo(x), [la, lb] = cols(inf.kind), prev = prevSets(x, o);
     const tmpl = ['44px', isT ? null : 'minmax(60px,1fr)', la ? (isT ? '1fr' : '74px') : null, lb ? (isT ? '1fr' : '64px') : null, isT ? null : '44px', '22px'].filter(Boolean).join(' ');
     let n = 0;
-    h += `<section class="w-ex"><header><div><h3>${esc(inf.name)}</h3><span>${esc([inf.muscle, inf.equipment].filter(Boolean).join(' · '))}</span></div><button class="w-x" data-act="ex-remove" data-ei="${ei}">Remove</button></header>
+    h += `<section class="w-ex"><header><div><h3>${esc(inf.name)}</h3><span>${esc([inf.muscle, inf.equipment].filter(Boolean).join(' · '))}</span></div><span class="w-acts">${view.kind === 'event' ? `<button class="w-x" data-act="prog-ex" data-key="${esc(exKey(x))}">Progress</button>` : ''}<button class="w-x" data-act="ex-remove" data-ei="${ei}">Remove</button></span></header>
       <input class="w-note" id="exn-${ei}" data-exnote="${ei}" value="${esc(x.note)}" placeholder="Add notes here…" aria-label="Exercise notes">
       <div class="w-tbl" style="--cols:${tmpl}"><div class="w-row h"><span style="text-align:center">Set</span>${isT ? '' : '<span style="text-align:center">Previous</span>'}${la ? `<span style="text-align:center">${la}</span>` : ''}${lb ? `<span style="text-align:center">${lb}</span>` : ''}${isT ? '' : '<span style="text-align:center">✓</span>'}<span></span></div>`;
     x.sets.forEach((s, si) => {
@@ -1188,6 +1402,7 @@ function renderDoc() {
   const o = curObj();
   if (!o) { view = { mode: 'week', date: view.date }; return renderWeek(); }
   if (view.kind === 'friend') return renderFriendDoc(o);
+  if (view.kind === 'feed') return renderFeedDoc(o);
   const k = view.kind, cal = k === 'event' ? calOf(o) : null, f = o.format;
   const backLabel = k === 'event' ? { year: 'Year', week: 'Week', day: 'Day', library: 'Library', calendars: 'Calendars' }[view.back.mode] : 'Library';
   const tag = [esc(fmtName(f)), cal && esc(cal.name), k === 'saved' && 'Template', k === 'preview' && 'Preview'].filter(Boolean).join(' · ');
@@ -1494,7 +1709,7 @@ async function importFile(file) {
 function render() {
   renderSub();
   document.body.classList.toggle('welcoming', view.mode === 'welcome');
-  $('main').innerHTML = ({ year: renderYear, week: renderWeek, day: renderDay, doc: renderDoc, library: renderLibrary, calendars: renderCalendars, builder: renderBuilder, settings: renderSettings, welcome: renderWelcome, friends: renderFriends }[view.mode] || renderWeek)();
+  $('main').innerHTML = ({ year: renderYear, week: renderWeek, day: renderDay, doc: renderDoc, library: renderLibrary, calendars: renderCalendars, builder: renderBuilder, settings: renderSettings, welcome: renderWelcome, friends: renderFriends, progress: renderProgress }[view.mode] || renderWeek)();
   renderModal();
   autosize();
 }
@@ -1515,7 +1730,7 @@ function go(mode, date) { leaveDoc(); modal = null; cycOpen = false; view = { mo
 function openDoc(kind, id) {
   const back = view.mode === 'doc' ? view.back : { mode: ['builder', 'settings', 'welcome'].includes(view.mode) ? 'week' : view.mode };
   leaveDoc(); modal = null;
-  const date = kind === 'event' ? db.events.find(e => e.id === id)?.date : kind === 'friend' ? (String(id).split('@')[1] || friendEvents().find(e => e.id === id)?.date) : view.date;
+  const date = kind === 'event' ? db.events.find(e => e.id === id)?.date : kind === 'feed' ? feedEvents().find(e => e.id === id)?.date : kind === 'friend' ? (String(id).split('@')[1] || friendEvents().find(e => e.id === id)?.date) : view.date;
   view = { mode: 'doc', kind, id, date: date || view.date, back };
   render(); window.scrollTo(0, 0);
 }
@@ -1546,6 +1761,18 @@ document.addEventListener('click', ev => {
   const a = t.dataset.act, o = curObj(), ds = t.dataset;
   switch (a) {
     case 'mode': go(ds.mode, view.date); break;
+    case 'prog-range': prog.range = ds.v; render(); break;
+    case 'prog-wk': prog.wk = ds.v; render(); break;
+    case 'prog-metric': prog.metric = ds.v; render(); break;
+    case 'prog-ex': { const wasDoc = view.mode === 'doc'; prog.ex = ds.key; prog.metric = ''; if (wasDoc) go('progress'); else { const y = scrollY; render(); scrollTo(0, y); } break; }
+    case 'feed-kind': feedForm = { ...feedForm, kind: ds.v, err: '', url: $('fd-url')?.value || '', name: $('fd-name')?.value || '' }; render(); break;
+    case 'feed-add': addFeed(); break;
+    case 'feed-refresh': { const f = feeds().find(x => x.id === ds.id); if (f) refreshFeed(f, true); break; }
+    case 'feed-color': { const f = feeds().find(x => x.id === ds.id); if (f) { f.color = ds.color; save(); render(); } break; }
+    case 'feed-toggle': { const f = feeds().find(x => x.id === ds.id); if (f) { f.hidden = !f.hidden; save(); render(); } break; }
+    case 'feed-del': confirmFeed = ds.id; render(); break;
+    case 'feed-del-cancel': confirmFeed = null; render(); break;
+    case 'feed-del-confirm': { const f = feeds().find(x => x.id === ds.id); confirmFeed = null; if (!f) break; db.prefs.feeds = feeds().filter(x => x !== f); delete feedData[f.id]; saveFeedData(); save(); render(); toast(`${f.name} unlinked`); break; }
     case 'bills-toggle': billsOpen = !billsOpen; softRender(); break;
     case 'cy-on': cyc.settings = { ...cyc.settings, on: ds.v === 'on' }; saveCycle([], true); render(); if (ds.v === 'on' && !cyc.settings.lastStart) $('cy-last')?.focus(); break;
     case 'cy-flow': case 'cy-energy': case 'cy-mood': case 'cy-sleep': {
@@ -1581,10 +1808,10 @@ document.addEventListener('click', ev => {
     case 'today': go(view.mode, todayS()); break;
     case 'day': go('day', ds.date); break;
     case 'week': go('week', ds.date); break;
-    case 'open': { if (ds.id.startsWith('f:')) { openDoc('friend', ds.id); break; } const id = ds.id.includes('@') ? materialize(ds.id) : ds.id; if (id) openDoc('event', id); break; }
+    case 'open': { if (ds.id.startsWith('f:')) { openDoc('friend', ds.id); break; } if (ds.id.startsWith('g:')) { openDoc('feed', ds.id); break; } const id = ds.id.includes('@') ? materialize(ds.id) : ds.id; if (id) openDoc('event', id); break; }
     case 'open-saved': openDoc('saved', ds.id); break;
     case 'preview': preview = sample(ds.fmt); openDoc('preview', 'preview'); break;
-    case 'back': go(view.kind === 'event' || view.kind === 'friend' ? view.back.mode : 'library', o?.date || view.date); break;
+    case 'back': go(['event', 'friend', 'feed'].includes(view.kind) ? view.back.mode : 'library', o?.date || view.date); break;
     case 'new': openNew({ calId: ds.cal, date: ds.date, format: ds.fmt, savedId: ds.saved }); break;
     case 'cal-toggle': { const c = db.calendars.find(x => x.id === ds.id); c.hidden = !c.hidden; save(); render(); break; }
     case 'lib-tab': libTab = ds.tab; confirmSaved = null; render(); break;
@@ -1757,6 +1984,7 @@ document.addEventListener('input', ev => {
   if (t.id === 'nm-until') { modal.until = t.value; return; }
   if (t.id === 'pk-q') { modal.q = t.value; $('pk-list').innerHTML = pickList(); return; }
   if (t.id === 'lib-q') { libQ = t.value; $('ex-list').innerHTML = exList(); return; }
+  if (ds.feed) { const f = feeds().find(x => x.id === ds.feed); if (f) { f.name = t.value; save(); } return; }
   if (ds.xl) { const e = db.exercises.find(x => x.id === ds.xl); if (e) { e[ds.xf] = t.value; save(); } return; }
   if (ds.cal) { const c = db.calendars.find(x => x.id === ds.cal); if (c) { c[ds.cf] = t.value; save(); } return; }
   if (view.mode === 'builder' && (ds.bf || ds.bb !== undefined)) {
@@ -1831,6 +2059,8 @@ document.addEventListener('change', ev => {
   const t = ev.target;
   if (t.id === 'cy-last' && view.mode === 'settings') setTimeout(() => softRender(), 0);   // waits for the date picker to close
   if ((t.id === 'cy-len' || t.id === 'cy-plen') && view.mode === 'settings') { const y = scrollY; render(); scrollTo(0, y); }
+  if (t.id === 'prog-ex') { prog.ex = t.value; prog.metric = ''; const y = scrollY; render(); scrollTo(0, y); }
+  if (t.dataset.feed && view.mode === 'calendars') softRender();
   if (t.id === 'imp-file' && t.files?.[0]) importFile(t.files[0]);
   if (t.dataset.impCal !== undefined && t.files?.[0]) { startImport(t.files[0], t.dataset.impCal); t.value = ''; }
 });
@@ -1848,7 +2078,7 @@ applyTheme();
 supa.auth.getSession().then(({ data }) => {
   authReady = true;
   if (data.session?.user) { startSession(data.session.user); return; }
-  if (guestMode || hasData(db)) { guestMode = true; setStatus('local'); loadNews(); }
+  if (guestMode || hasData(db)) { guestMode = true; setStatus('local'); loadNews(); refreshFeeds(); }
   else view = { mode: 'welcome', date: todayS() };
   render();
 });
