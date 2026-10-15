@@ -85,13 +85,16 @@ export function toTimes(v) {
 }
 export const toNum = v => { if (typeof v === 'number') return v; const m = String(v ?? '').replace(',', '.').match(/-?\d+(\.\d+)?/); return m ? +m[0] : null; };
 const numText = v => { const n = toNum(v); return n === null ? '' : String(Math.round(n * 100) / 100); };
+// Durations like 0:45 or 1:30 (minutes:seconds) for planks and other timed holds.
+const isClock = v => typeof v === 'string' && /^\s*\d{1,2}:\d{2}\s*$/.test(v);
+const clock = v => isClock(v) ? v.trim() : typeof v === 'number' || (typeof v === 'string' && v.trim()) ? String(v).trim() : '';
 const text = v => v instanceof Date ? toDate(v) || '' : String(v ?? '').trim();
 
 /* ---------- columns ---------- */
 export const FIELDS = {
   workout: [
     ['date', 'Date', true], ['exercise', 'Exercise', true], ['sets', 'Sets'], ['reps', 'Reps'], ['weight', 'Weight'],
-    ['title', 'Workout name'], ['time', 'Time'], ['notes', 'Notes'],
+    ['title', 'Workout name'], ['time', 'Time'], ['notes', 'Notes'], ['wnotes', 'Workout notes'],
   ],
   events: [['date', 'Date', true], ['title', 'Title', true], ['time', 'Time'], ['end', 'End time'], ['notes', 'Notes']],
 };
@@ -105,6 +108,7 @@ const NAMES = {
   time: ['time', 'start', 'starttime', 'from', 'begins'],
   end: ['end', 'endtime', 'until', 'to', 'ends', 'finish'],
   notes: ['notes', 'note', 'description', 'details', 'comments', 'comment', 'memo'],
+  wnotes: ['workoutnotes', 'sessionnotes', 'daynotes'],
 };
 const norm = s => String(s ?? '').toLowerCase().replace(/\(.*?\)/g, m => m.replace(/[()]/g, '')).replace(/[^a-z0-9]/g, '');
 export function guessMap(headers, kind) {
@@ -152,7 +156,8 @@ export function planWorkouts({ data, map, headers = [] }, { cal, db, today, uid,
     if (!name) { skipped.push({ row: i, why: 'no exercise' }); return; }
     const title = text(get(r, 'title')) || 'Workout', key = `${date}\u0000${title.toLowerCase()}`;
     if (!groups.has(key)) groups.set(key, { date, title, time: toTimes(get(r, 'time')), notes: [], rows: [] });
-    const g = groups.get(key), note = text(get(r, 'notes'));
+    const g = groups.get(key), note = text(get(r, 'notes')), wnote = text(get(r, 'wnotes'));
+    if (wnote && !g.notes.includes(wnote)) g.notes.push(wnote);
     g.rows.push({ name, sets: get(r, 'sets'), reps: get(r, 'reps'), weight: get(r, 'weight'), note });
   });
   const setCol = map.sets !== undefined ? norm(headers[map.sets]) : '';
@@ -167,10 +172,10 @@ export function planWorkouts({ data, map, headers = [] }, { cal, db, today, uid,
     for (const k of order) {
       const rs = byName.get(k), name = rs[0].name;
       let ex = findExercise(lib, name);
-      const hasW = rs.some(r => toNum(r.weight) !== null);
+      const hasW = rs.some(r => toNum(r.weight) !== null && !isClock(r.weight)), hasT = rs.some(r => isClock(r.weight) || isClock(r.reps));
       if (!ex) {   // new to the library: borrow muscle and equipment from the common list when the name matches
         const known = findExercise(starter, name);
-        ex = known ? { ...known, id: uid() } : { id: uid(), name, muscle: 'Other', equipment: 'Other', kind: hasW ? 'weight' : 'reps' };
+        ex = known ? { ...known, id: uid() } : { id: uid(), name, muscle: 'Other', equipment: 'Other', kind: hasT ? 'time' : hasW ? 'weight' : 'reps' };
         lib.push(ex); newExercises.push(ex);
       }
       const nums = rs.map(r => toNum(r.sets));
@@ -178,12 +183,13 @@ export function planWorkouts({ data, map, headers = [] }, { cal, db, today, uid,
       const done = g.date <= today, sets = [];
       for (const r of rs) {
         const n = perSet ? 1 : Math.min(Math.max(1, Math.round(toNum(r.sets) || 1)), 20);
-        for (let j = 0; j < n; j++) sets.push({ t: 'n', a: ex.kind === 'reps' ? '' : numText(r.weight), b: numText(r.reps), done });
+        const set = ex.kind === 'time' ? { a: clock(r.weight) || clock(r.reps), b: '' } : { a: ex.kind === 'reps' ? '' : numText(r.weight), b: numText(r.reps) };
+        for (let j = 0; j < n; j++) sets.push({ t: 'n', ...set, done });
       }
       const note = [...new Set(rs.map(r => r.note).filter(Boolean))].join('; ');
       exercises.push({ exId: ex.id, name: ex.name, kind: ex.kind, muscle: ex.muscle, note, sets });
     }
-    events.push({ id: uid(), calId: cal.id, date: g.date, title: g.title, start: g.time.start, end: g.time.end, format: 'workout', data: { exercises, notes: '' } });
+    events.push({ id: uid(), calId: cal.id, date: g.date, title: g.title, start: g.time.start, end: g.time.end, format: 'workout', data: { exercises, notes: g.notes.join('\n\n') } });
   }
   events.sort((a, b) => a.date.localeCompare(b.date));
   return { events, newExercises, skipped, dupes, range: events.length ? [events[0].date, events[events.length - 1].date] : null };
